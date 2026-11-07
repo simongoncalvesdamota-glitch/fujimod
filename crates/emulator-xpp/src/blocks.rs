@@ -225,9 +225,12 @@ impl Block {
         frames: Option<Frames>,
     ) -> Result<Self, String> {
         let bit = |(o, mask): (u64, u32)| o & 3 != 0 || o >= size || mask == 0;
-        if base & 0xfff != 0
+        // A block is a word-aligned register file inside one 4 KiB page. It may
+        // start after another model's window in the same page (XP4 0xfff4a520,
+        // after the DMA request multiplexer at 0xfff4a500..0xfff4a520).
+        if base & 3 != 0
             || size == 0
-            || size > 0x1000
+            || (base & 0xfff) + size > 0x1000
             || size & 3 != 0
             || idle.iter().any(|&b| bit(b))
             || frames.is_some_and(|f| {
@@ -435,7 +438,10 @@ impl Block {
         self.fixed = fixed;
         Ok(self)
     }
-    /// Commands that set a field of a status word.
+    /// Commands that set a field of a status word. A command may name its own
+    /// word as the status: the field takes the state right after the write, a
+    /// self-clearing busy bit whose work completes at once (XP4 0xff505384:
+    /// the firmware writes 1 and waits for bit 0 to read clear).
     pub fn with_commands(mut self, commands: Vec<Command>) -> Result<Self, String> {
         let word = |o: u64| o & 3 != 0 || o >= self.size;
         let special = |o: u64| {
@@ -453,7 +459,6 @@ impl Block {
         if commands.iter().any(|c| {
             word(c.word)
                 || word(c.status)
-                || c.word == c.status
                 || c.mask == 0
                 || c.state & !c.mask != 0
                 || special(c.word)
@@ -743,12 +748,29 @@ impl Block {
         let offset = address.checked_sub(self.base)?;
         (size == 4 && offset & 3 == 0 && offset < self.size).then_some(offset)
     }
+    /// A naturally aligned byte or halfword access to a word of the block:
+    /// the word's address, the bit shift of the lane and the lane mask.
+    fn lane(&self, address: u64, size: u8) -> Option<(u64, u32, u64)> {
+        let offset = address.checked_sub(self.base)?;
+        let mask = match size {
+            1 => 0xff,
+            2 => 0xffff,
+            _ => return None,
+        };
+        (offset & u64::from(size - 1) == 0 && offset < self.size)
+            .then(|| (address & !3, ((offset & 3) * 8) as u32, mask))
+    }
 }
 impl Device for Block {
     fn name(&self) -> &'static str {
         "xpp-register-block"
     }
     fn read(&mut self, cx: &mut Cx<'_>, address: u64, size: u8) -> u64 {
+        // XP4 byte-wide controllers (0xfff3e000) and SDHCI halfword fields
+        // read their lane of the word, with the word's idle and fixed bits.
+        if let Some((word, shift, mask)) = self.lane(address, size) {
+            return (self.read(cx, word, 4) >> shift) & mask;
+        }
         let Some(offset) = self.offset(address, size) else {
             cx.unmodeled();
             return 0;
@@ -777,6 +799,18 @@ impl Device for Block {
         )
     }
     fn write(&mut self, cx: &mut Cx<'_>, address: u64, size: u8, value: u64) {
+        // A lane write updates its lane of the stored word, then acts as a
+        // whole-word write of the merged value (commands compare that word).
+        if let Some((word, shift, mask)) = self.lane(address, size) {
+            let stored = u64::from(
+                self.state
+                    .words
+                    .get(&(word - self.base))
+                    .copied()
+                    .unwrap_or(0),
+            );
+            return self.write(cx, word, 4, stored & !(mask << shift) | (value & mask) << shift);
+        }
         if let (Some(job), Some(offset), Ok(value)) =
             (self.job, self.offset(address, size), u32::try_from(value))
         {

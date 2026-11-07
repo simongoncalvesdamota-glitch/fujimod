@@ -35,6 +35,9 @@ pub struct Wiring {
     pub reset_ticks: u64,
     /// None receives frame edges from an explicitly connected upstream model.
     pub period_ticks: Option<u64>,
+    /// Ignore enable bits of undeclared channels instead of reporting them
+    /// (XP4 X-T3 5.11 live view sets some); they are never armed.
+    pub ignore_undeclared: bool,
 }
 #[derive(Default, Serialize, Deserialize)]
 struct State {
@@ -183,7 +186,9 @@ impl Device for InputBuffer {
             s.regs.insert(o, pending);
         } else if matches!(o, 4 | 8) {
             let word = (o / 4 - 1) as usize;
-            if value & (value >> 16) & !self.wiring.enables[word] != 0 {
+            if !self.wiring.ignore_undeclared
+                && value & (value >> 16) & !self.wiring.enables[word] != 0
+            {
                 cx.unmodeled();
             }
             let mask = (value >> 16) & self.wiring.enables[word];
@@ -273,6 +278,7 @@ mod tests {
                     ready: 0x2e8,
                     max_offset: 0x2e8,
                     write_limit: 0x2e4,
+                    ignore_undeclared: false,
                     enables: [0x100, 0],
                     causes: [0x100, 0],
                     outputs: vec![Output {

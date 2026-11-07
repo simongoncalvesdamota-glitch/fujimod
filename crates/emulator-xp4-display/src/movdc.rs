@@ -20,6 +20,8 @@ pub struct Movdc {
     period_ticks: u64,
     luma: u8,
     state: State,
+    /// See [`Movdc::latch_configuration`]; construction input, not state.
+    latch: bool,
 }
 impl Movdc {
     pub fn new(
@@ -47,6 +49,7 @@ impl Movdc {
                 regs: vec![0; 0x10c / 4],
                 ..State::default()
             },
+            latch: false,
         })
     }
     fn r(&self, offset: usize) -> u32 {
@@ -118,6 +121,20 @@ impl Movdc {
             0 | 4 | 8 | 0x18 | 0xc0 | 0xc4 | 0xc8 | 0xcc | 0xd0 | 0xd4 | 0xd8 | 0xdc
         )
     }
+    /// Configuration words outside the modeled front end (ISP coefficients,
+    /// crop/filter and watermark fields X-T3 5.11 programs when live view
+    /// starts): plain latches that change nothing in the produced frames.
+    /// The +e0 counters stay unmodeled.
+    fn latch(&self, offset: u64) -> bool {
+        self.latch && offset & 3 == 0 && offset < 0x10c && offset != 0xe0 && !Self::known(offset)
+    }
+    /// Latch the configuration words outside the modeled front end instead of
+    /// refusing them. The selected output and ISP modes are then not
+    /// emulated: frames keep the declared processed-frame input.
+    pub fn latch_configuration(mut self) -> Self {
+        self.latch = true;
+        self
+    }
 }
 impl Device for Movdc {
     fn name(&self) -> &'static str {
@@ -130,6 +147,9 @@ impl Device for Movdc {
     fn read(&mut self, cx: &mut Cx<'_>, address: u64, size: u8) -> u64 {
         self.advance(cx);
         let offset = address.wrapping_sub(self.base);
+        if size == 4 && self.latch(offset) {
+            return u64::from(self.r(offset as usize));
+        }
         if size != 4 || !Self::known(offset) {
             cx.unmodeled();
             return 0; // +e0's two 5-bit counters are unresolved.
@@ -143,6 +163,10 @@ impl Device for Movdc {
     fn write(&mut self, cx: &mut Cx<'_>, address: u64, size: u8, value: u64) {
         self.advance(cx);
         let offset = address.wrapping_sub(self.base);
+        if size == 4 && self.latch(offset) {
+            self.state.regs[offset as usize / 4] = value as u32;
+            return;
+        }
         if size != 4 || !Self::known(offset) {
             cx.unmodeled();
             return;

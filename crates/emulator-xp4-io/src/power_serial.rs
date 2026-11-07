@@ -74,9 +74,12 @@ impl PowerSerial {
         if inputs.iter().any(|(k, v)| (3..=6).contains(k) && *v > 1023)
             || port >= 16
             || pin >= 16
+            // 13 and 27 are read-only status words X-T3 5.11 reads after the
+            // first-start page (13 under semaphore 0x8f, 27 by the battery
+            // monitor 0x10a1d90); their values are explicit body inputs.
             || inputs
                 .keys()
-                .any(|k| !matches!(*k, 0..=6 | 16 | 24 | 32 | 34 | 35))
+                .any(|k| !matches!(*k, 0..=6 | 13 | 16 | 24 | 27 | 32 | 34 | 35))
             || [0, 1, 2, 3, 32, 34, 35]
                 .iter()
                 .any(|n| !inputs.contains_key(n))
@@ -108,8 +111,11 @@ impl PowerSerial {
             rtc,
         })
     }
+    /// Words the firmware writes through 10a20d4. X-T3 5.11 also writes 13,
+    /// 14, 16, 17 and 37 after the first-start page; a written word reads back
+    /// its last write, an unwritten one its declared input (or 0).
     fn writable(register: u8) -> bool {
-        matches!(register, 2 | 18 | 32 | 34 | 35 | 38 | 48..=55)
+        matches!(register, 2 | 13 | 14 | 16 | 17 | 18 | 32 | 34 | 35 | 37 | 38 | 48..=55)
     }
 }
 impl Input for PowerSerial {

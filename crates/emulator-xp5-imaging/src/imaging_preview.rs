@@ -75,6 +75,7 @@ impl Preview {
                 ready: 0x504,
                 max_offset: 0x508,
                 write_limit: 0x500,
+                ignore_undeclared: false,
                 enables: [0x7ff, 0x3f],
                 causes: [0x7ff, 0x3f],
                 outputs: vec![

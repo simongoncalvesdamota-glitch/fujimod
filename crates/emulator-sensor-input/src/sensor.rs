@@ -38,6 +38,10 @@ impl Default for SensorState {
 pub struct ImageRoutes {
     pub dma: Option<[u32; 2]>,
     pub timing: [u32; 2],
+    /// Without DMA routes, latch the read-out DMA configuration words (and
+    /// +0x38) instead of refusing them; no image moves and no DMA interrupt
+    /// rises. XP4 X-T3 5.11 programs them when live view starts.
+    pub latch_unrouted: bool,
 }
 #[derive(Clone)]
 pub struct Sensor(pub Arc<Mutex<SensorState>>, Option<ImageRoutes>, (u16, u8));
@@ -131,8 +135,12 @@ impl Sensor {
         Ok(())
     }
     fn image_supported(&self, offset: u64) -> bool {
-        self.1
-            .is_some_and(|r| matches!(offset, 0x140 | 0x144) || r.dma.is_some())
+        self.1.is_some_and(|r| {
+            if offset == 0x38 {
+                return r.latch_unrouted && r.dma.is_none();
+            }
+            matches!(offset, 0x140 | 0x144) || r.dma.is_some() || r.latch_unrouted
+        })
     }
     pub fn streaming(&self) -> bool {
         let s = self.0.lock().unwrap();
@@ -230,7 +238,7 @@ impl Device for Command {
         }
         match o {
             0 => u64::from(self.reg(0) | 1),
-            0x4..=0x34 | 0x40..=0x94 | 0xc0..=0x114 | 0x140 | 0x144 => {
+            0x4..=0x38 | 0x40..=0x94 | 0xc0..=0x114 | 0x140 | 0x144 => {
                 if !self.sensor.image_supported(o) {
                     cx.unmodeled();
                     return 0;
@@ -281,7 +289,7 @@ impl Device for Command {
                     cx.fail("invalid sensor command start");
                 }
             }
-            0x4..=0x34 | 0x40..=0x94 | 0xc0..=0x114 | 0x140 | 0x144 => {
+            0x4..=0x38 | 0x40..=0x94 | 0xc0..=0x114 | 0x140 | 0x144 => {
                 if !self.sensor.image_supported(o) {
                     cx.unmodeled();
                     return;
@@ -375,6 +383,7 @@ mod tests {
             Some(ImageRoutes {
                 dma: None,
                 timing: [100, 102],
+                latch_unrouted: false,
             }),
             (0x51, 8),
         );

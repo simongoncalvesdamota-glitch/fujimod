@@ -267,14 +267,9 @@ impl Device for Statistics {
             cx.unmodeled();
             return 0;
         }
-        // Only four color planes are currently decoded. Other fields stay visible.
-        let within = at % self.bank_size;
-        if !((within + size as usize <= 0x1000)
-            || (within >= 0x1060 && within + size as usize <= 0x1c60))
-        {
-            cx.unmodeled();
-            return 0;
-        }
+        // Only four color planes are decoded. Other fields (X-T3 5.11 reads
+        // +0x2060.. after live view starts) read back the SRAM bytes, which
+        // the engine never writes: they read their last host or guest write.
         let s = self.state.lock().unwrap();
         let mut bytes = [0; 8];
         bytes[..size as usize].copy_from_slice(&s.bytes[at..at + size as usize]);

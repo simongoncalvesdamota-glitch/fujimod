@@ -58,6 +58,13 @@ pub struct Devices {
     usb: Option<Arc<Mutex<Dwc3>>>,
     pub frames: BTreeMap<usize, Frame>,
     pub outputs: BTreeMap<usize, serde_json::Value>,
+    /// Earliest event or model deadline, cached when `due` found nothing due.
+    /// `None` means unknown: any access, external input or deadline work can
+    /// move a model's deadline, so each of them clears the cache. A model's
+    /// deadline only depends on time as "due now" while a state is pending,
+    /// which `due` sees when it recomputes, so a cached future deadline stays
+    /// exact until the devices change.
+    deadline: Option<Option<u64>>,
 }
 struct PhysicalHost<'a> {
     cluster: &'a Cluster,
@@ -147,6 +154,7 @@ impl Devices {
         channel: usize,
         sample: u16,
     ) -> Result<(), String> {
+        self.changed();
         if let Some(adc) = &self.xpp_adc {
             return adc.lock().unwrap().set_input(channel, sample);
         }
@@ -164,6 +172,7 @@ impl Devices {
             .set_input(&mut Cx::new(&mut host, 0, 0, *id), channel, sample)
     }
     pub fn set_gpio_input(&mut self, port: usize, pin: usize, high: bool) -> Result<(), String> {
+        self.changed();
         if port >= 16 || pin >= 16 {
             return Err("Invalid XP4 external GPIO pin".into());
         }
@@ -417,18 +426,20 @@ impl Devices {
         self.windows.push((base, base + 0x604, id));
         Ok(())
     }
+    /// Each clock word (SDHCI 0x2C) with the word after it (0x2E: timeout
+    /// control and software resets), which the model also owns.
     pub fn sd_clocks(&mut self, words: &[(u64, u64)]) -> Result<(), String> {
         if words.iter().any(|&(address, _)| {
             self.windows
                 .iter()
-                .any(|&(lo, hi, _)| address < hi && lo < address + 2)
+                .any(|&(lo, hi, _)| address < hi && lo < address + 4)
         }) {
             return Err("Overlapping SDHCI clock wiring".into());
         }
         let model = fujimod_emulator_ip::sdhci::Clocks::new(words)?;
         let id = self.models.len();
         self.windows
-            .extend(words.iter().map(|&(address, _)| (address, address + 2, id)));
+            .extend(words.iter().map(|&(address, _)| (address, address + 4, id)));
         self.models.push(Some(Box::new(model)));
         Ok(())
     }
@@ -450,7 +461,8 @@ impl Devices {
                 return Err("Overlapping XP4 MOVDC window".into());
             }
             let model =
-                fujimod_emulator_xp4_display::movdc::Movdc::new(base, irq, reset, period, luma)?;
+                fujimod_emulator_xp4_display::movdc::Movdc::new(base, irq, reset, period, luma)?
+                    .latch_configuration();
             let id = self.models.len();
             self.models.push(Some(Box::new(model)));
             self.windows.push((base, base + 0x10c, id));
@@ -484,6 +496,7 @@ impl Devices {
             Some(sensor::ImageRoutes {
                 dma: None,
                 timing: timing_irqs.try_into().unwrap(),
+                latch_unrouted: true,
             }),
             read_gate,
         );
@@ -533,6 +546,7 @@ impl Devices {
                     ready: 0x2e8,
                     max_offset: 0x2e8,
                     write_limit: 0x2e4,
+                    ignore_undeclared: true,
                     enables: [0x100, 0],
                     causes: [0x100, 0],
                     outputs: vec![Output {
@@ -587,6 +601,7 @@ impl Devices {
             usb: None,
             frames: BTreeMap::new(),
             outputs: BTreeMap::new(),
+            deadline: None,
         }
     }
     pub fn io_groups(&mut self, base: u64) {
@@ -669,6 +684,7 @@ impl Devices {
             usb: None,
             frames: BTreeMap::new(),
             outputs: BTreeMap::new(),
+            deadline: None,
             windows: vec![
                 (storage::CONTROLLER, storage::CONTROLLER + 0x100, 0),
                 (storage::FLASH, storage::FLASH + storage::FLASH_SIZE, 0),
@@ -1329,6 +1345,7 @@ impl Devices {
         write: bool,
         value: u64,
     ) -> Result<Option<(u64, bool)>, String> {
+        self.changed();
         let Some(id) = self.owner(address, size) else {
             return Ok(None);
         };
@@ -1372,8 +1389,19 @@ impl Devices {
             )
             .min()
     }
+    /// The devices changed outside `due`: forget the cached deadline.
+    pub fn changed(&mut self) {
+        self.deadline = None;
+    }
     pub fn due(&mut self, c: &Cluster) -> Result<(), String> {
         let now = unsafe { (*c.state.get()).ticks };
+        if self
+            .deadline
+            .is_some_and(|at| at.is_none_or(|at| at > now))
+        {
+            return Ok(());
+        }
+        self.deadline = None;
         for _ in 0..64 {
             let event = self.events.iter().next().copied().filter(|e| e.0 <= now);
             let id = event.map(|e| e.1).or_else(|| {
@@ -1383,6 +1411,7 @@ impl Devices {
                 })
             });
             let Some(id) = id else {
+                self.deadline = Some(self.next_deadline(now));
                 return Ok(());
             };
             let mut model = self.models[id].take().unwrap();

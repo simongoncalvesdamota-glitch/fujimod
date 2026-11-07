@@ -386,6 +386,7 @@ mod tests {
             Some(super::super::sensor::ImageRoutes {
                 dma: Some([162, 163]),
                 timing: [166, 164],
+                latch_unrouted: false,
             }),
             (0x59, 4),
         );

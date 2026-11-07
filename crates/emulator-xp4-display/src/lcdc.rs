@@ -146,11 +146,15 @@ impl Lcdc {
         })?;
         self.status(cx, true, source, Some(format), &planes)
     }
+    /// Words the firmware programs. +0x28 (written when live view starts),
+    /// +0x30 (X-T3 writes 0, later 0x20080001, and reads it back) and +0x1c4
+    /// (written 0) are plain latches: they read back their last write and
+    /// select nothing in the decoded output.
     fn register(offset: u64) -> bool {
         matches!(
             offset,
-            0 | 4 | 8 | 0x10 | 0x14 | 0x18 | 0x1c | 0x20 | 0x24 | 0x2c | 0x600
-        ) || ((0x40..=0x320).contains(&offset) && offset != 0x1c4)
+            0 | 4 | 8 | 0x10 | 0x14 | 0x18 | 0x1c | 0x20 | 0x24 | 0x28 | 0x2c | 0x30 | 0x600
+        ) || (0x40..=0x320).contains(&offset)
             || (0x400..=0x514).contains(&offset)
     }
 }

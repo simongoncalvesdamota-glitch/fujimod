@@ -14,7 +14,15 @@ const WRITABLE: u16 = 0xffc5;
 struct Clock {
     control: u16,
     deadline: Option<u64>,
+    /// Timeout Control byte, the word's low half at clock + 2 (SDHCI 0x2E).
+    #[serde(default)]
+    timeout: u8,
 }
+
+/// Software Reset bits (SDHCI 0x2F: all, CMD line, DAT line), the high half
+/// of the word at clock + 2. A reset completes at once, so they read clear:
+/// X-T3 5.11 writes 0x200 then 0x400 and polls until they clear.
+const RESETS: u64 = 0x0700;
 
 /// One or more independently programmed internal/card output clock words.
 #[derive(Serialize, Deserialize)]
@@ -29,7 +37,7 @@ impl Clocks {
             || words.len() > 16
             || timing.len() != words.len()
             || words.iter().any(|&(address, ticks)| {
-                address & 1 != 0 || address > u32::MAX as u64 - 1 || ticks == 0
+                address & 1 != 0 || address > u32::MAX as u64 - 3 || ticks == 0
             })
         {
             return Err("Invalid SDHCI clock wiring or settling input".into());
@@ -43,6 +51,7 @@ impl Clocks {
                         Clock {
                             control: 0,
                             deadline: None,
+                            timeout: 0,
                         },
                     )
                 })
@@ -60,6 +69,11 @@ impl Device for Clocks {
         "sdhci-clocks"
     }
     fn read(&mut self, cx: &mut Cx<'_>, address: u64, size: u8) -> u64 {
+        if let Some(clock) = address.checked_sub(2).and_then(|a| self.state.get(&a))
+            && size == 2
+        {
+            return u64::from(clock.timeout);
+        }
         if size != 2 || !self.state.contains_key(&address) {
             cx.unmodeled();
             return 0;
@@ -68,6 +82,16 @@ impl Device for Clocks {
         u64::from(self.state[&address].control)
     }
     fn write(&mut self, cx: &mut Cx<'_>, address: u64, size: u8, value: u64) {
+        if let Some(clock) = address.checked_sub(2).and_then(|a| self.state.get_mut(&a))
+            && size == 2
+        {
+            if value & !(0xff | RESETS) != 0 {
+                cx.unmodeled();
+                return;
+            }
+            clock.timeout = value as u8;
+            return;
+        }
         if size != 2
             || value > u16::MAX as u64
             || value & !u64::from(WRITABLE | STABLE) != 0

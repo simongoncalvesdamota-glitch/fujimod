@@ -209,6 +209,7 @@ impl Cluster {
         let now = state.ticks;
         let mut devices = state.devices.take().ok_or("A7 devices are not wired")?;
         let result = action(&mut devices, now);
+        devices.changed();
         unsafe {
             (*self.state.get()).devices = Some(devices);
         }
@@ -2046,7 +2047,10 @@ impl Session {
         }
         let mut exit = cpu.run(Run {
             begin: u64::from(start),
-            until: Some(u64::MAX),
+            // No exit address: the instruction budget bounds the slice. An
+            // exit at u64::MAX makes the backend invalidate the empty code
+            // range [u64::MAX, u64::MAX], which Unicorn refuses (UC_ERR_ARG).
+            until: None,
             watchdog_us: 0,
             instructions: Some(budget),
         });
