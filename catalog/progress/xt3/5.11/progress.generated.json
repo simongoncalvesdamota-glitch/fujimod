@@ -17,7 +17,7 @@
         {
           "id": "research",
           "title": "Update file registered, unpacked and its corpus exported",
-          "result": "not-run"
+          "result": "pass"
         },
         {
           "id": "analysis",
@@ -42,7 +42,7 @@
         {
           "id": "flash-reader",
           "title": "Flash reader located",
-          "result": "not-run"
+          "result": "pass"
         },
         {
           "id": "state-regions",

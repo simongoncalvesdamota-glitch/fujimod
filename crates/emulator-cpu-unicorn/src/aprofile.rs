@@ -57,7 +57,14 @@ struct Execution {
     write_hook: Cell<Option<HookId>>,
     wide_code_watch: Cell<bool>,
     stores: RefCell<Vec<(Access, u64, i32, i64)>>,
+    // ARMv7-A owner options (see `Core::set_owner_exclusives`).
+    exclusive_exits: Cell<bool>,
+    owner_interrupts: Cell<bool>,
+    // Guest addresses of translated instructions, while an owner asks.
+    translations: TranslationLog,
 }
+/// Shared log of translated instruction addresses (`None`: not logging).
+pub type TranslationLog = Rc<RefCell<Option<Vec<u64>>>>;
 pub struct Core {
     execution: Rc<Execution>,
 }
@@ -111,6 +118,9 @@ impl Core {
             write_hook: Cell::new(None),
             wide_code_watch: Cell::new(false),
             stores: RefCell::new(vec![]),
+            exclusive_exits: Cell::new(false),
+            owner_interrupts: Cell::new(false),
+            translations: Rc::new(RefCell::new(None)),
         });
         let owner: Rc<dyn CodeOwner> = e.clone();
         e.id.set(e.memory.register(Rc::downgrade(&owner)));
@@ -153,6 +163,38 @@ impl Core {
         }
         Ok(Self { execution: e })
     }
+    /// ARMv7-A owners that keep their own cluster-wide exclusive monitor:
+    /// LDREX/STREX (all widths) and CLREX also exit before entry, like the
+    /// framework instructions, so the owner performs them.
+    pub fn set_owner_exclusives(&self, on: bool) -> Result<(), String> {
+        let e = &self.execution;
+        if e.active.get() || !e.a32 {
+            return Err("owner exclusives need a stopped ARMv7-A processor".into());
+        }
+        e.exclusive_exits.set(on);
+        e.cpu.invalidate_code(None)
+    }
+    /// The log of translated instruction addresses: an owner sets it to
+    /// `Some` to record every instruction the translator admits (coverage of
+    /// entered code), drains it, and sets `None` to stop.
+    pub fn translation_log(&self) -> TranslationLog {
+        self.execution.translations.clone()
+    }
+    /// ARMv7-A owners that enter IRQs at their own instruction boundaries:
+    /// an asserted, unmasked IRQ stops the run before the next block instead
+    /// of being entered here, so the owner sees it at an exact boundary.
+    pub fn set_owner_interrupts(&self, on: bool) -> Result<(), String> {
+        let e = &self.execution;
+        if e.active.get() || !e.a32 {
+            return Err("owner interrupts need a stopped ARMv7-A processor".into());
+        }
+        e.owner_interrupts.set(on);
+        Ok(())
+    }
+}
+/// ARMv7-A ARM-state LDREX/STREX family (any width) and CLREX encodings.
+fn exclusive_instruction(word: u32) -> bool {
+    word & 0x0f900fff == 0x01900f9f || word & 0x0f900ff0 == 0x01800f90 || word == 0xf57ff01f
 }
 impl Drop for Execution {
     fn drop(&mut self) {
@@ -220,6 +262,9 @@ impl Execution {
         let _ = self.cpu.stop();
     }
     fn classify(&self, address: u64, word: u32) -> Result<Translation, String> {
+        if let Some(log) = self.translations.borrow_mut().as_mut() {
+            log.push(address);
+        }
         let physical = self.cpu.translate(address, Access::Fetch)?;
         self.memory.note_code(self.id.get(), physical, 4)?;
         self.memory.apply_watches()?;
@@ -251,6 +296,7 @@ impl Execution {
     fn framework(&self, word: u32) -> bool {
         if self.a32 {
             armv7a::framework_instruction(word)
+                || (self.exclusive_exits.get() && exclusive_instruction(word))
         } else {
             arm64::framework_instruction(word)
         }
@@ -369,6 +415,10 @@ impl Execution {
     }
     fn deliver_interrupt(&self) -> Result<bool, String> {
         if self.a32 {
+            if self.owner_interrupts.get() {
+                // Stop for the owner; it enters the IRQ itself.
+                return Ok(self.irq.get() && self.scalar(arm::CPSR)? & 0x80 == 0);
+            }
             // The ARMv7-A board profile routes IRQ only.
             let entered = self.irq.get() && armv7a::enter_irq(&*self.cpu)?;
             if entered {

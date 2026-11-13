@@ -85,6 +85,16 @@ pub trait Bus: Send + 'static {
     fn stop(&mut self);
     fn save(&self) -> Value;
     fn restore(&mut self, value: &Value) -> Result<(), String>;
+    /// Outside-driven register values of the target at `address` (a plan
+    /// input, e.g. a touch report); `false` when no such target is declared.
+    fn set_registers(&mut self, _address: u16, _registers: &BTreeMap<u8, u16>) -> Result<bool, String> {
+        Ok(false)
+    }
+    /// Interrupt line changes of the targets since the last call, in order,
+    /// as (GIC line, level); targets without an interrupt output have none.
+    fn take_lines(&mut self) -> Vec<(u32, bool)> {
+        Vec::new()
+    }
     /// Complete typed target state; targets without one refuse.
     fn checkpoint(&self) -> Result<fujimod_emulator_devices::checkpoint::Checkpoint, String> {
         Err("DesignWare I2C bus has no exact checkpoint implementation".into())
@@ -184,6 +194,9 @@ impl<B: Bus> Controller<B> {
         raw
     }
     fn update_line(&mut self, cx: &mut Cx<'_>) {
+        for (line, level) in self.bus.take_lines() {
+            cx.set_irq(line, level);
+        }
         let level = self.raw() & self.word(INTR_MASK) != 0;
         if level != self.state.line {
             self.state.line = level;

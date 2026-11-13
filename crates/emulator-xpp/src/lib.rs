@@ -17,6 +17,8 @@ pub mod flash;
 pub mod i2c;
 pub mod imaging;
 pub mod jpeg;
+pub mod job_ack;
+pub mod mali_v61;
 pub mod keys;
 pub mod lens;
 pub mod power;

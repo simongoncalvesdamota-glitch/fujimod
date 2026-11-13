@@ -62,6 +62,10 @@ impl Decoder<'_> {
         let (sw, sh) = self.pair(geometry, 0xfff)?;
         let (x, y) = self.pair(geometry + 4, 0x1fff)?;
         let (w, h) = self.pair(geometry + 8, 0xfff)?;
+        // The panel shows what falls on it: playing a 16:9 movie, the 5.11
+        // firmware puts the 720x480 video picture at y 37 at 1:1 on the
+        // 480-line panel, so its last 37 rows fall below the panel.
+        let (w, h) = (w.min(width.saturating_sub(x)), h.min(height.saturating_sub(y)));
         let (dx, dy) = self.pair(geometry + 12, 0x7fff)?;
         if sw == 0
             || sh == 0
@@ -166,5 +170,31 @@ mod tests {
         assert_eq!(&rgba[..8], &[10, 20, 30, 255, 10, 20, 30, 255]);
         regs[8 / 4] |= 2;
         assert!(decode(&regs, Some(Picture::Bgra8888Straight), None).is_err());
+    }
+    #[test]
+    fn a_video_picture_past_the_panel_is_cut_at_its_edge() {
+        // Movie playback: 720x480 picture at y 37, 1:1, on a 720x480 panel.
+        let mut regs = vec![0; REGISTER_BYTES / 4];
+        for (o, v) in [
+            (4, 1),
+            (8, 0x10),
+            (0x14, 720),
+            (0x20, 480),
+            (0x168, 0x2b46_5000),
+            (0x16c, 0xb8),
+            (0x170, 0x1e0_02d0),
+            (0x174, 0x25_0000),
+            (0x178, 0x1e0_02d0),
+            (0x17c, 0x1000_1000),
+        ] {
+            regs[o / 4] = v;
+        }
+        let out = decode(&regs, None, Some(Video::YyCbCr422)).unwrap().unwrap();
+        let p = &out.layers[0].plane;
+        assert_eq!((p.work_x, p.work_y, p.work_width, p.work_height), (0, 37, 720, 443));
+        assert_eq!((p.source_width, p.source_height, p.stride), (720, 480, 0xb8 * 8));
+        // A picture that starts past the panel is still refused.
+        regs[0x174 / 4] = 480 << 16;
+        assert!(decode(&regs, None, Some(Video::YyCbCr422)).is_err());
     }
 }

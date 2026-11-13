@@ -35,6 +35,14 @@ pub struct Options {
     /// writes the JPEG file from the second bank (0xbed74000).
     #[serde(default, skip_serializing_if = "Vec::is_empty")]
     pub ram_banks: Vec<(u64, u64)>,
+    /// Further wrapper words (word-aligned offsets) that read back their last
+    /// write, for any access width: XP4 X-T3 5.11 programs +0x78 (halfword)
+    /// and +0x80 on its SD channels. What they configure is not modeled.
+    #[serde(default, skip_serializing_if = "Vec::is_empty")]
+    pub extra_vendor: Vec<u64>,
+    /// Declared SDHCI Capabilities words (+0x40, +0x44) of the bank.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub capabilities: Option<[u32; 2]>,
 }
 type Saved = (Options, Option<u64>, BTreeMap<u64, u32>, Option<u64>);
 pub struct Controller {
@@ -64,6 +72,9 @@ impl Controller {
             initialization_fault: host::InitializationFault::None,
             high_speed: options.high_speed,
             ram_banks: options.ram_banks.clone(),
+            capabilities: options.capabilities,
+            line_levels: false,
+            write_protect_active_high: false,
         };
         let host = if let Some(irq) = irq {
             SdHost::new(
@@ -110,6 +121,18 @@ impl Controller {
             self.host.hardware_reset(cx)?;
         }
         let vendor = address.wrapping_sub(self.options.base);
+        let word = vendor & !3;
+        if self.options.extra_vendor.contains(&word) && vendor + u64::from(size) <= word + 4 {
+            let shift = ((vendor - word) * 8) as u32;
+            let mask = if size == 4 { u32::MAX } else { (1u32 << (size * 8)) - 1 };
+            let stored = self.vendor.get(&word).copied().unwrap_or(0);
+            if let Some(v) = value {
+                let merged = stored & !(mask << shift) | (v as u32 & mask) << shift;
+                self.vendor.insert(word, merged);
+                return Ok(0);
+            }
+            return Ok(u64::from((stored >> shift) & mask));
+        }
         if size == 4 && VENDOR.contains(&vendor) {
             if let Some(v) = value {
                 if vendor == UPDATE && v as u32 & UPDATE_DONE != 0 {
@@ -248,7 +271,9 @@ impl Device for Controller {
         if options != self.options {
             return Err("SD wrapper checkpoint wiring differs".into());
         }
-        if vendor.keys().any(|offset| !VENDOR.contains(offset))
+        if vendor
+            .keys()
+            .any(|offset| !VENDOR.contains(offset) && !options.extra_vendor.contains(offset))
             || seen.is_some() != self.reset.is_some()
         {
             return Err("SD wrapper checkpoint vendor/reset shape differs".into());
@@ -321,6 +346,8 @@ mod tests {
                 ram_bytes: 0x10000,
                 high_speed: false,
                 ram_banks: vec![],
+                extra_vendor: vec![],
+                capabilities: None,
             };
             let mut d = Controller::new(options, card, Contacts::new(true, false), None).unwrap();
             let mut h = TestHost::new();
@@ -396,6 +423,8 @@ mod tests {
             ram_bytes: 0x10000,
             high_speed: false,
             ram_banks: vec![],
+            extra_vendor: vec![],
+            capabilities: None,
         };
         let mut gates = crate::resets::Gates::new(0xfff0a000).unwrap();
         let mut d = Controller::new(options, card, Contacts::new(true, false), None)
@@ -455,6 +484,8 @@ mod tests {
                 ram_bytes: 0x10000,
                 high_speed: false,
                 ram_banks: vec![],
+                extra_vendor: vec![],
+                capabilities: None,
             };
             Controller::new(options, card, Contacts::new(true, false), None).unwrap()
         };

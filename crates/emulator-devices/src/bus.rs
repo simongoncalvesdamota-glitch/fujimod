@@ -428,6 +428,16 @@ pub trait Device: Send + std::any::Any {
     fn set_scene(&mut self, _scene: &serde_json::Value) -> Result<bool, String> {
         Ok(false)
     }
+    /// Explicit register values for the I2C target at `address` on the bus
+    /// controller at `base` (a plan input). Returns whether this model took them.
+    fn set_i2c_registers(
+        &mut self,
+        _base: u64,
+        _address: u16,
+        _registers: &std::collections::BTreeMap<u8, u16>,
+    ) -> Result<bool, String> {
+        Ok(false)
+    }
     /// Drain host artifact work when a run ends; no guest effects are allowed.
     fn finish(&mut self) -> Result<(), String> {
         Ok(())

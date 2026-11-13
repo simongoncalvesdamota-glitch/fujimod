@@ -925,6 +925,7 @@ fn rectangles(
         let gpu_context = fujimod_emulator_gpu::context()?;
         let _gpu_guard = gpu_context.acquire()?;
         let gpu_coverages = gpu_coverage::coverage_batch(&coverage_inputs)?;
+        let mut verified = None;
         if verify_gpu {
             let cpu_coverages: Vec<_> = coverage_inputs
                 .iter()
@@ -942,7 +943,10 @@ fn rectangles(
                     ));
                 }
             }
-            paint_cpu_draws(&prepared, &coverage_inputs, &cpu_coverages, &mut output)?;
+            let mut cpu_output = output.clone();
+            let written =
+                paint_cpu_draws(&prepared, &coverage_inputs, &cpu_coverages, &mut cpu_output)?;
+            verified = Some((cpu_output, written));
         }
 
         let mut surfaces: BTreeMap<u64, Arc<fujimod_emulator_gpu::GpuSurface>> = BTreeMap::new();
@@ -1059,8 +1063,8 @@ fn rectangles(
         let mut gpu_writes = Vec::new();
         for (address, surface) in &surfaces {
             let readback = gpu_context.readback(surface.key())?;
-            if verify_gpu {
-                let cpu_bytes = &output.get(address).unwrap().2;
+            if let Some((cpu_output, _)) = &verified {
+                let cpu_bytes = &cpu_output.get(address).unwrap().2;
                 if cpu_bytes != &readback.bytes {
                     let offset = cpu_bytes
                         .iter()
@@ -1082,11 +1086,8 @@ fn rectangles(
                 gpu_writes.push((range_address, readback.bytes[offset..end].to_vec()));
             }
         }
-        if verify_gpu {
-            return Ok(output
-                .into_iter()
-                .map(|(address, (_, _, bytes))| (address, bytes))
-                .collect());
+        if let Some((cpu_output, written)) = &verified {
+            return Ok(written_ranges(cpu_output, written));
         }
         return Ok(gpu_writes);
     }
@@ -1095,11 +1096,38 @@ fn rectangles(
         .iter()
         .map(scanline::coverage_image)
         .collect();
-    paint_cpu_draws(&prepared, &coverage_inputs, &coverages, &mut output)?;
-    Ok(output
-        .into_iter()
-        .map(|(address, (_, _, bytes))| (address, bytes))
-        .collect())
+    let written = paint_cpu_draws(&prepared, &coverage_inputs, &coverages, &mut output)?;
+    Ok(written_ranges(&output, &written))
+}
+
+/// The written pixels of each target as runs of guest bytes. A job's writes
+/// land at its DMA deadline, so pixels the draws did not touch must not be
+/// written back: the guest may have changed them since the submission, as the
+/// GPU path's write masks already respect.
+fn written_ranges(
+    output: &BTreeMap<u64, (u32, u32, Vec<u8>)>,
+    written: &BTreeMap<u64, Vec<bool>>,
+) -> Vec<(u64, Vec<u8>)> {
+    let mut ranges = Vec::new();
+    for (address, flags) in written {
+        let bytes = &output.get(address).unwrap().2;
+        let mut index = 0;
+        while index < flags.len() {
+            if !flags[index] {
+                index += 1;
+                continue;
+            }
+            let start = index;
+            while index < flags.len() && flags[index] {
+                index += 1;
+            }
+            ranges.push((
+                address + start as u64 * 4,
+                bytes[start * 4..index * 4].to_vec(),
+            ));
+        }
+    }
+    ranges
 }
 
 #[cfg(not(target_arch = "wasm32"))]
@@ -1114,10 +1142,11 @@ fn paint_cpu_draws(
     coverage_inputs: &[scanline::CoverageInput],
     coverages: &[Vec<u32>],
     output: &mut BTreeMap<u64, (u32, u32, Vec<u8>)>,
-) -> Result<(), String> {
+) -> Result<BTreeMap<u64, Vec<bool>>, String> {
     if prepared.len() != coverage_inputs.len() || prepared.len() != coverages.len() {
         return Err("DMP paint coverage batch length mismatch".into());
     }
+    let mut written: BTreeMap<u64, Vec<bool>> = BTreeMap::new();
     for draw in prepared {
         let input = &coverage_inputs[draw.coverage_index];
         let coverage = &coverages[draw.coverage_index];
@@ -1126,6 +1155,9 @@ fn paint_cpu_draws(
         let regs = &draw.fill.stream.regs;
         let gamma = &draw.fill.stream.gamma;
         let bytes = &mut output.get_mut(&draw.address).unwrap().2;
+        let flags = written
+            .entry(draw.address)
+            .or_insert_with(|| vec![false; bytes.len() / 4]);
         for y in y0..y1 {
             for x in x0..x1 {
                 if !draw.clips.iter().any(|clip| {
@@ -1161,10 +1193,11 @@ fn paint_cpu_draws(
                     draw.blend,
                 );
                 bytes[index..index + 4].copy_from_slice(&pixel);
+                flags[index / 4] = true;
             }
         }
     }
-    Ok(())
+    Ok(written)
 }
 
 #[cfg(test)]

@@ -54,6 +54,23 @@ pub struct Options {
     /// Further DRAM banks SDMA reaches: (physical base, bytes).
     #[serde(default, skip_serializing_if = "Vec::is_empty")]
     pub ram_banks: Vec<(u64, u64)>,
+    /// Declared Capabilities words (+0x40, +0x44), read-only. Absent, the
+    /// registers stay unmodeled. XP4 X-T3 5.11 reads +0x44 at start-up.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub capabilities: Option<[u32; 2]>,
+    /// Present State also reports the pin and line levels of an idle host:
+    /// CD (bit 18) while present, WP (bit 19) while writable, DAT[3:0]
+    /// (bits 20-23, DAT0 low while a data command holds the lines) and CMD
+    /// (bit 24); its halfwords are readable. XP4 X-T3 5.11 reads +0x26 and
+    /// requires DAT[3:0] high (0x10857ec). Off, the earlier word is kept.
+    #[serde(default)]
+    pub line_levels: bool,
+    /// With `line_levels`, the WP pin level (bit 19) is high while the card
+    /// is write protected instead of while it is writable. XP4 X-T3 5.11
+    /// reports "card protected" when bit 19 is set (0x10878ac); the X70's
+    /// write-protect GPIO is likewise active high.
+    #[serde(default)]
+    pub write_protect_active_high: bool,
 }
 const MAX_DATA_FAULTS: usize = 32;
 const COMMAND_TIMEOUT_ERROR: u16 = 1;
@@ -966,6 +983,14 @@ impl SdHost {
                 };
         }
         let offset = address.wrapping_sub(self.options.base) as usize;
+        if let Some(caps) = self.options.capabilities
+            && (0x40..0x48).contains(&offset)
+            && matches!(size, 2 | 4)
+            && offset % usize::from(size) == 0
+        {
+            let word = caps[(offset - 0x40) / 4];
+            return u64::from(if size == 4 { word } else { (word >> ((offset & 2) * 8)) & 0xffff });
+        }
         if !self.valid(offset, size) {
             cx.unmodeled();
             return 0;
@@ -983,8 +1008,28 @@ impl SdHost {
                 }
             };
         }
+        if self.options.line_levels && size == 2 && matches!(offset, 0x24 | 0x26) {
+            let word = self.read_register(cx, self.options.base + 0x24, 4);
+            return if offset == 0x26 { word >> 16 } else { word & 0xffff };
+        }
         if offset == 0x24 {
-            return 0x20000
+            let levels = if self.options.line_levels {
+                let data_busy = self.request.as_ref().is_some_and(|r| {
+                    r.phase != Phase::Ready && (r.quantity != 0 || matches!(r.command, 7 | 12))
+                });
+                0x0100_0000
+                    | if data_busy { 0x00e0_0000 } else { 0x00f0_0000 }
+                    | if self.contacts.present() { 0x4_0000 } else { 0 }
+                    | if self.contacts.protected() == self.options.write_protect_active_high {
+                        0x8_0000
+                    } else {
+                        0
+                    }
+            } else {
+                0
+            };
+            return levels
+                | 0x20000
                 | if self.contacts.present() { 0x10000 } else { 0 }
                 | self.request.as_ref().map_or(0, |r| {
                     if r.phase == Phase::Ready {
@@ -1174,8 +1219,13 @@ impl SdHost {
             // Host-control-2 bit 8 (UHS-II interface enable) and UHS mode 7
             // (UHS-II) are SDHCI 4 UHS-II selections; GFX 50R 0xcac788 probes
             // them. A default-speed card has no UHS-II lanes, so they select
-            // nothing; other UHS modes and tuning still refuse.
-            || offset == 0x3e && value & !0x100 != 0 && value & !0x107 != 0
+            // nothing; other UHS modes and tuning still refuse. Bit 12 (Host
+            // Version 4 Enable), set with bit 8 by XP4 X-T3 5.11 (0x1100), is
+            // stored with no effect: version-4 DMA addressing is not modeled.
+            // Bits 4-5 (Driver Strength Select) only act at 1.8 V signaling
+            // (bit 3, still refused); X-T3 5.11 writes 0x30 after CMD6
+            // (0x1086ec8). They are stored with no effect.
+            || offset == 0x3e && value & !0x1130 != 0 && value & !0x1137 != 0
             || offset == 0x3e && value & 7 != 0 && value & 7 != 7
             || offset == 0x100 && value & !7 != 0
             || offset == 0x104 && value != 0
@@ -1518,6 +1568,9 @@ mod tests {
                 initialization_fault: InitializationFault::None,
                 high_speed: false,
                 ram_banks: vec![],
+                capabilities: None,
+                line_levels: false,
+                write_protect_active_high: false,
             },
             Wiring {
                 card: Card::new(sd_card::Options {

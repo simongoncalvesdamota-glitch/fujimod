@@ -40,8 +40,18 @@
 //! and waits for bit 0 through 0x1560de8). Idle bits may share the status
 //! word when they do not overlap the status bit (0xfffc4000: +0x3c bit 20
 //! idle, bit 0 done; 0xfffc3000: +0xdc 0x01000100 idle, bit 0 done, which
-//! its handler 0xcce510 clears through 0xc6d580). What a job computes is not
-//! modeled.
+//! its handler 0xcce510 clears through 0xc6d580). A job with neither a status
+//! nor a stop bit is a pulse job: when it finishes, its start bit reads clear
+//! again and its edge line pulses once, with nothing to acknowledge (XP4
+//! X-T3 5.11 0xfffa8000: 0x1091630 sets +0x04 bit 0 and returns, GIC 144's
+//! handler 0x1090e24 reads no register; 0x1091150 instead polls bit 0 back
+//! to 0). What a job computes is not modeled.
+//!
+//! A status job may also declare that its start bit clears when it ends:
+//! X-T3 5.11 IIFP 0xfff6f000 (job 8, GIC 134, handler 0x1dbb344) starts with
+//! +0x00 bit 0 (0x1dbc0b4) and acknowledges +0x84; 0x1dbb6c8 later writes
+//! +0x00 back with a read-modify-write, which would start a second job if the
+//! bit still read set.
 //!
 //! A block may declare [`Command`]s: writing exactly a command's value to its
 //! word sets the declared field of a status word, which otherwise reads back
@@ -105,7 +115,149 @@ pub enum Work {
     Develop { phase: (u8, u8) },
     /// The resizer.
     Resize,
+    /// X-T3 5.11 RECC 0xfff82000 (job 71, GIC 129), a declared stand-in for
+    /// the development: see [`Recc`].
+    Recc(Recc),
+    /// X-T3 5.11 audio format converter 0xfffa8000 (job 0x71, GIC 144): see
+    /// [`AUDIO_CONTROL`].
+    Audio,
 }
+/// X-T3 5.11 audio format converter 0xfffa8000, as its driver programs it
+/// (0x1091220, 0x1091630; register trace of a movie playback, run LV111i):
+///
+/// - +0x08: bit 0 converts (clear, +0x04 loads the firmware table addressed
+///   by +0x0c/+0x10, 0x1091150); source sample format in bits 8..10 and
+///   destination format in bits 24..26 (0x111a4bc: 1 = 16-bit, 2 = 24-bit
+///   packed, 3 = 32-bit);
+/// - source at +0x18 (high bits +0x14), line bytes +0x1c, lines +0x20;
+///   destination at +0x28 (high bits +0x24), +0x2c, +0x30; +0x34 and +0x38
+///   repeat the source and destination line bytes in both halves;
+/// - movie playback, 720 stereo frames a job: 90 lines of 0x30 bytes
+///   (24-bit packed) become 90 lines of 0x40 bytes (32-bit) that DMA
+///   channel 7 sends to serial audio port 0. Recording goes the other way.
+///
+/// The declared stand-in converts each signed little-endian sample
+/// left-justified ([`convert_audio`]): 24 to 32 bits shifts left by 8, 32 to
+/// 24 keeps the top 24 bits. The firmware table (a microcode of 16-bit
+/// slots) is not decoded: the law is declared, not measured. Other
+/// geometries are left unconverted and counted.
+pub const AUDIO_CONTROL: u64 = 0x08;
+const AUDIO_SOURCE_HIGH: u64 = 0x14;
+const AUDIO_SOURCE: u64 = 0x18;
+const AUDIO_SOURCE_LINE: u64 = 0x1c;
+const AUDIO_SOURCE_LINES: u64 = 0x20;
+const AUDIO_DESTINATION_HIGH: u64 = 0x24;
+const AUDIO_DESTINATION: u64 = 0x28;
+const AUDIO_DESTINATION_LINE: u64 = 0x2c;
+const AUDIO_DESTINATION_LINES: u64 = 0x30;
+const AUDIO_SOURCE_PITCH: u64 = 0x34;
+const AUDIO_DESTINATION_PITCH: u64 = 0x38;
+/// Converts `source`, samples of `from` bytes, to samples of `to` bytes
+/// (2, 3 or 4, signed little-endian), left-justified: the sample's top bits
+/// stay its top bits, the low bits added are zero, the low bits dropped are
+/// truncated.
+pub fn convert_audio(source: &[u8], from: usize, to: usize) -> Vec<u8> {
+    source
+        .chunks_exact(from)
+        .flat_map(|sample| {
+            let mut slot = [0u8; 4];
+            slot[4 - from..].copy_from_slice(sample);
+            let mut out = [0u8; 4];
+            out[..to].copy_from_slice(&slot[4 - to..]);
+            out.into_iter().take(to)
+        })
+        .collect()
+}
+/// RECC as X-T3 5.11 programs it for a still (0x1dc3490; HLE-E5r register
+/// log of the three jobs of one shot):
+///
+/// - mode +0x08 = 0x620000, twice: channel 1 reads the RAW at +0x0c (high
+///   bits +0x10), pitch +0x14, from line +0x1c >> 16; +0x18 is the band
+///   (lines << 16 | pixels: 2088 x 6256); channel 4 writes the picture at
+///   +0x70 (high bits +0x74), pitch +0x80, from line +0x54 >> 16. The second
+///   job sets both line words to 2088: two bands of one picture, written 64
+///   lines and 128 pixels into B (the margins of the next job).
+/// - mode +0x08 = 2: channel 2 reads +0x3c (high bits +0x40), pitch +0x4c,
+///   size +0x50 (4176 x 6256), and channel 4 writes it to B itself.
+///
+/// The declared stand-in develops each band in color
+/// ([`crate::development::develop`]) and copies the last job's picture as
+/// it is (its own processing, distortion correction among others, is not
+/// modeled). It writes only inside `area`; every job is logged (source,
+/// destination, lines written).
+///
+/// With [`ReccMovie`] (opt-in, [`Block::with_recc_movie`]) it also models the
+/// 4K movie mode, see there.
+#[derive(Clone, Copy, Debug, PartialEq)]
+pub struct Recc {
+    /// RAW: address and line pitch in bytes, for the X-Trans phase.
+    pub raw: (u64, u64),
+    /// X-Trans site (line, sample) in [`crate::development::XTRANS`] of the
+    /// RAW's first sample.
+    pub site: (u8, u8),
+    /// Where RECC may write: address and length in bytes.
+    pub area: (u64, u64),
+}
+const RECC_MODE: u64 = 0x08;
+const RECC_SOURCE: u64 = 0x0c;
+const RECC_SOURCE_HIGH: u64 = 0x10;
+const RECC_SOURCE_PITCH: u64 = 0x14;
+const RECC_BAND: u64 = 0x18;
+const RECC_SOURCE_LINE: u64 = 0x1c;
+const RECC_SECOND: u64 = 0x3c;
+const RECC_SECOND_HIGH: u64 = 0x40;
+const RECC_SECOND_PITCH: u64 = 0x4c;
+const RECC_SECOND_SIZE: u64 = 0x50;
+const RECC_DESTINATION_LINE: u64 = 0x54;
+const RECC_DESTINATION: u64 = 0x70;
+const RECC_DESTINATION_HIGH: u64 = 0x74;
+const RECC_DESTINATION_PITCH: u64 = 0x80;
+const RECC_DEVELOP: u32 = 0x62_0000;
+const RECC_MOVIE: u32 = 0x42_2000;
+const RECC_MOVIE_SOURCE_WIDTH: u64 = 0x20;
+const RECC_MOVIE_LINES: u64 = 0x50;
+const RECC_MOVIE_WIDTH: u64 = 0x58;
+const RECC_MOVIE_OUTPUT: u64 = 0x6c;
+/// RECC in the X-T3 5.11 4K movie (REC 4K, service 0x1293 "RECMB_SV_YC",
+/// recfReccProcess 0x1e901d0; run RC4K-a register log): mode +0x08 =
+/// 0x422000, two bands per picture (cores 3 then 0). Channel 1 reads the RAW
+/// at +0x0c (high bits +0x10; the MemYc buffer + 0x360, where the sensor
+/// read-out starts), pitch +0x14 (0x3600), from line +0x1c >> 16 (332 then
+/// 2084), +0x24 >> 16 lines (1752 then 1760), +0x20 samples a line (6272:
+/// 6252 rounded up to 0x20). Channel 4 writes the YC picture at +0x70 (high
+/// bits +0x74; a MemResz buffer), pitch +0x80 (0x9000, two lines a row), from
+/// line +0x54 >> 16 (0 then 1314), +0x50 >> 16 lines (1316 then 1320, the
+/// first band 2 lines past its share), +0x58 pixels a line (4704). The
+/// firmware scales by 3/4 down and across (0x1e717e0): 4704 / 6272.
+///
+/// The declared stand-in maps picture line `first_out + j` to RAW line
+/// `first_in + j * 6272 / 4704` and pixel x to sample x * 6272 / 4704
+/// (nearest neighbour, the engine's filter is not modeled), so that the
+/// lines two bands share come out the same; it reads 16-bit samples (the
+/// firmware's RAW is 12-bit packed, format 0x40101: a declared difference)
+/// and writes `layout` rows: grey (luma (sample << 2) >> `shift`, chroma 512)
+/// or, with `color`, the band developed by [`crate::development::develop`]
+/// first. The row layout is the output code in +0x6c bits 1..0, as
+/// 0x1dc2f74 writes it from the output format (0x11563bc converts its
+/// pixels to bytes): 3 = 0x80802, 10-bit 4:2:0 in line pairs at twice the
+/// descriptor's pitch, written as Y0L2 rows ([`YcLayout::Y0l2`]; the bit
+/// order inside a block is drm_fourcc.h's, declared); 0 = 0x100402, 8-bit
+/// 4:2:2, one line a row ([`YcLayout::Lines`], the still's layout). Codes 1
+/// (8-bit 4:2:0) and 2 (10-bit 4:2:2, three samples a word) are not modeled:
+/// such a band is logged and nothing is written.
+///
+/// [`YcLayout::Y0l2`]: crate::development::YcLayout::Y0l2
+/// [`YcLayout::Lines`]: crate::development::YcLayout::Lines
+#[derive(Clone, Copy, Debug, PartialEq)]
+pub struct ReccMovie {
+    pub shift: u32,
+    pub color: bool,
+}
+const RECC_COPY: u32 = 2;
+/// RECC jobs kept in the log.
+const RECC_LOG: usize = 64;
+/// RECC jobs whose whole register file is kept.
+const RECC_WORDS: usize = 8;
 const DEVELOP_SOURCE: u64 = 0x08;
 const DEVELOP_SOURCE_STRIDE: u64 = 0x0c;
 const DEVELOP_SIZE: u64 = 0x14;
@@ -167,6 +319,18 @@ struct State {
     status: u32,
     #[serde(default, skip_serializing_if = "is_zero")]
     jobs: u64,
+    /// RECC jobs: (source, destination, lines developed).
+    #[serde(default, skip_serializing_if = "Vec::is_empty")]
+    recc: Vec<(u64, u64, u64)>,
+    /// The register file of the first RECC jobs, as each started.
+    #[serde(default, skip_serializing_if = "Vec::is_empty")]
+    recc_words: Vec<BTreeMap<u64, u32>>,
+    /// Audio converter jobs converted, and conversion jobs left unconverted
+    /// (unmodeled format or geometry); table loads count in neither.
+    #[serde(default, skip_serializing_if = "is_zero")]
+    audio_converted: u64,
+    #[serde(default, skip_serializing_if = "is_zero")]
+    audio_skipped: u64,
 }
 const BUFFER: u64 = 0xc0;
 const WIDTH: u64 = 0xc4;
@@ -189,14 +353,35 @@ pub struct Block {
     /// (offset, value) of words that read a fixed value whatever is written.
     fixed: Vec<(u64, u32)>,
     commands: Vec<Command>,
+    /// The start bit of a status job reads clear again once the job ends.
+    start_clears: bool,
     /// Where this block publishes its words.
     published: Option<Published>,
+    /// Report name naming the block by its base (opt-in, see `with_own_name`).
+    own_name: Option<&'static str>,
     /// The color unit's words, for the film law of a development job, and
     /// the declared reference white balance.
     color: Option<(Published, [u32; 3])>,
     /// The still tone unit's words (matrix, curves and brightness table of the
     /// still law), for a development job.
     tone: Option<Published>,
+    /// RECC only (opt-in): the published words of the tone unit and of the
+    /// YCbCr unit whose firmware color replaces the declared sRGB.
+    recc_color: Option<(Published, Published, bool)>,
+    /// RECC only (opt-in): the published words of the LUT unit's control
+    /// block and of the blocks of its table, 0x1000 bytes each in order.
+    recc_lut3d: Option<(Published, Vec<Published>)>,
+    /// RECC only (opt-in): also apply the YCbCr unit's 2x2 chroma matrix.
+    recc_chroma_matrix: bool,
+    /// RECC only (opt-in): also apply the tone unit's brightness gain.
+    recc_brightness_gain: bool,
+    /// RECC only (opt-in): also apply the YCbCr unit's luma bands.
+    recc_luma_bands: bool,
+    /// RECC only (opt-in): also apply the tone unit's white balance relative
+    /// to these declared reference (R, G, B) gains.
+    recc_white_balance: Option<[u32; 3]>,
+    /// RECC only (opt-in): the 4K movie mode 0x422000.
+    recc_movie: Option<ReccMovie>,
     /// The published integration value and scene-light scale the film
     /// picture's light follows.
     film_exposure: Option<crate::statistics::Exposure>,
@@ -253,9 +438,18 @@ impl Block {
             image: None,
             fixed: Vec::new(),
             commands: Vec::new(),
+            start_clears: false,
             published: None,
+            own_name: None,
             color: None,
             tone: None,
+            recc_color: None,
+            recc_lut3d: None,
+            recc_chroma_matrix: false,
+            recc_brightness_gain: false,
+            recc_luma_bands: false,
+            recc_white_balance: None,
+            recc_movie: None,
             film_exposure: None,
             film_light: None,
             film_picture: None,
@@ -268,7 +462,7 @@ impl Block {
         let bit = |(o, mask): (u64, u32)| o & 3 != 0 || o >= self.size || mask == 0;
         if self.frames.is_some()
             || bit(job.start)
-            || job.status.is_some() == job.stop.is_some()
+            || job.status.is_some() && job.stop.is_some()
             || job.stop.is_some_and(bit)
             || job.status.is_some_and(|status| {
                 bit(status)
@@ -286,18 +480,38 @@ impl Block {
         self.job = Some(job);
         Ok(self)
     }
+    /// The start bit of the block's status job clears when the job ends.
+    pub fn with_start_clearing(mut self) -> Result<Self, String> {
+        if !self.job.is_some_and(|j| j.status.is_some()) {
+            return Err("Only a status job's start bit can clear itself".into());
+        }
+        self.start_clears = true;
+        Ok(self)
+    }
     /// Data the job moves when it finishes.
     pub fn with_work(mut self, work: Work) -> Result<Self, String> {
         let words = match work {
             Work::Develop { phase } if phase.0 < 6 && phase.1 < 6 => DEVELOP_DESTINATION_STRIDE,
             Work::Resize => RESIZE_FORMAT,
             Work::Develop { .. } => return Err("Invalid X-Trans phase".into()),
+            Work::Recc(r) if r.site.0 < 6 && r.site.1 < 6 && r.raw.1 >= 12 && r.area.1 > 0 => {
+                RECC_DESTINATION_PITCH
+            }
+            Work::Recc(_) => return Err("Invalid RECC geometry".into()),
+            Work::Audio => AUDIO_DESTINATION_PITCH,
         };
         if self.job.is_none() || words >= self.size {
             return Err("Invalid X-Processor Pro register block work".into());
         }
         self.work = Some(work);
         Ok(self)
+    }
+    /// Report this block as `xpp-register-block@<base>` rather than under the
+    /// name every plain block shares, so its words can be read after a run.
+    pub fn with_own_name(mut self) -> Self {
+        let name = format!("xpp-register-block@{:#x}", self.base);
+        self.own_name = Some(Box::leak(name.into_boxed_str()));
+        self
     }
     /// Publish this block's words to `words`.
     pub fn with_published(mut self, words: Published) -> Self {
@@ -312,6 +526,98 @@ impl Block {
             return Err("Only a development job reads a color unit".into());
         }
         self.color = Some((words, reference));
+        Ok(self)
+    }
+    /// RECC: develop with the firmware color of the tone unit's and the YCbCr
+    /// unit's published words, as they stand when each job starts (see
+    /// [`crate::development::FirmwareColor`]); with `chroma_modes`, also
+    /// honour the YCbCr unit's chroma mode fields
+    /// ([`crate::development::FirmwareColor::with_chroma_modes`]).
+    pub fn with_recc_color(
+        mut self,
+        tone: Published,
+        ycbcr: Published,
+        chroma_modes: bool,
+    ) -> Result<Self, String> {
+        if !matches!(self.work, Some(Work::Recc(_))) {
+            return Err("Only RECC develops with the firmware color".into());
+        }
+        if Arc::ptr_eq(&tone, &ycbcr) {
+            return Err("The tone and YCbCr units are two blocks".into());
+        }
+        self.recc_color = Some((tone, ycbcr, chroma_modes));
+        Ok(self)
+    }
+    /// RECC with the firmware color: also apply the 3D lookup table of the
+    /// LUT unit's published words, as they stand when each job starts (see
+    /// [`crate::development::FirmwareColor::with_lut3d`]): `control` the
+    /// block whose +0x00 bit 0 enables it, `table` the blocks that hold it,
+    /// 0x1000 bytes each.
+    pub fn with_recc_lut3d(mut self, control: Published, table: Vec<Published>) -> Result<Self, String> {
+        if self.recc_color.is_none() {
+            return Err("Only RECC with the firmware color reads a lookup table".into());
+        }
+        if table.len() as u64 * 0x1000 != crate::development::LUT_BYTES
+            || table.iter().any(|t| Arc::ptr_eq(t, &control))
+        {
+            return Err("The lookup table spans eight blocks apart from its control block".into());
+        }
+        self.recc_lut3d = Some((control, table));
+        Ok(self)
+    }
+    /// RECC with the firmware color: also apply the 2x2 chroma matrix of the
+    /// YCbCr unit's published words (see
+    /// [`crate::development::FirmwareColor::with_chroma_matrix`]).
+    pub fn with_recc_chroma_matrix(mut self) -> Result<Self, String> {
+        if self.recc_color.is_none() {
+            return Err("Only RECC with the firmware color reads a chroma matrix".into());
+        }
+        self.recc_chroma_matrix = true;
+        Ok(self)
+    }
+    /// RECC with the firmware color: also apply the brightness gain of the
+    /// tone unit's published words (see
+    /// [`crate::development::FirmwareColor::with_brightness_gain`]).
+    pub fn with_recc_brightness_gain(mut self) -> Result<Self, String> {
+        if self.recc_color.is_none() {
+            return Err("Only RECC with the firmware color reads a brightness gain".into());
+        }
+        self.recc_brightness_gain = true;
+        Ok(self)
+    }
+    /// RECC with the firmware color: also apply the luma bands of the YCbCr
+    /// unit's published words (see
+    /// [`crate::development::FirmwareColor::with_luma_bands`]).
+    pub fn with_recc_luma_bands(mut self) -> Result<Self, String> {
+        if self.recc_color.is_none() {
+            return Err("Only RECC with the firmware color reads luma bands".into());
+        }
+        self.recc_luma_bands = true;
+        Ok(self)
+    }
+    /// RECC: also model the 4K movie mode 0x422000 (opt-in, see [`ReccMovie`]).
+    pub fn with_recc_movie(mut self, movie: ReccMovie) -> Result<Self, String> {
+        if !matches!(self.work, Some(Work::Recc(_))) {
+            return Err("Only RECC has a movie mode".into());
+        }
+        if movie.shift > 16 {
+            return Err("Invalid RECC movie shift".into());
+        }
+        self.recc_movie = Some(movie);
+        Ok(self)
+    }
+    /// RECC with the firmware color: also apply the white balance of the tone
+    /// unit's published words, relative to the declared `reference` (R, G, B)
+    /// gains at which the declared scene renders neutral (see
+    /// [`crate::development::FirmwareColor::with_white_balance`]).
+    pub fn with_recc_white_balance(mut self, reference: [u32; 3]) -> Result<Self, String> {
+        if self.recc_color.is_none() {
+            return Err("Only RECC with the firmware color reads a white balance".into());
+        }
+        if reference.contains(&0) {
+            return Err("a declared reference white-balance gain is zero".into());
+        }
+        self.recc_white_balance = Some(reference);
         Ok(self)
     }
     /// Develop with the matrix and curves of the still tone unit's published
@@ -329,11 +635,245 @@ impl Block {
             *words.lock().unwrap() = self.state.words.clone();
         }
     }
+    /// One audio converter job: None for a table load, Some(true) once
+    /// converted, Some(false) for an unmodeled format or geometry.
+    fn run_audio(&self, cx: &mut Cx<'_>) -> Result<Option<bool>, String> {
+        let word = |o| self.state.words.get(&o).copied().unwrap_or(0);
+        let control = word(AUDIO_CONTROL);
+        if control & 1 == 0 {
+            return Ok(None);
+        }
+        let width = |code: u32| match code {
+            1 => Some(2usize),
+            2 => Some(3),
+            3 => Some(4),
+            _ => None,
+        };
+        let (Some(from), Some(to)) = (width(control >> 8 & 7), width(control >> 24 & 7)) else {
+            return Ok(Some(false));
+        };
+        let line = |o| word(o) as usize;
+        let (source_line, lines) = (line(AUDIO_SOURCE_LINE), line(AUDIO_SOURCE_LINES));
+        let destination_line = line(AUDIO_DESTINATION_LINE);
+        let both = |o: u64, bytes: usize| {
+            let w = word(o) as usize;
+            w & 0x3ff == bytes && w >> 16 & 0x3ff == bytes
+        };
+        if source_line == 0
+            || lines == 0
+            || line(AUDIO_DESTINATION_LINES) != lines
+            || source_line % from != 0
+            || destination_line % to != 0
+            || source_line / from != destination_line / to
+            || !both(AUDIO_SOURCE_PITCH, source_line)
+            || !both(AUDIO_DESTINATION_PITCH, destination_line)
+        {
+            return Ok(Some(false));
+        }
+        let address = |low, high| u64::from(word(high) & 3) << 32 | u64::from(word(low));
+        let source = cx.ram_bytes(address(AUDIO_SOURCE, AUDIO_SOURCE_HIGH), source_line * lines)?;
+        cx.ram_write(
+            address(AUDIO_DESTINATION, AUDIO_DESTINATION_HIGH),
+            &convert_audio(&source, from, to),
+        )?;
+        Ok(Some(true))
+    }
+    /// One RECC job: its log entry (source, destination, lines written).
+    fn run_recc(&self, cx: &mut Cx<'_>, r: Recc) -> Result<(u64, u64, u64), String> {
+        let word = |o| u64::from(self.state.words.get(&o).copied().unwrap_or(0));
+        let address = |low, high| (word(high) & 3) << 32 | word(low);
+        let size = |o| (word(o) >> 16, word(o) & 0xffff);
+        let mode = word(RECC_MODE) as u32;
+        if let (RECC_MOVIE, Some(movie)) = (mode, self.recc_movie) {
+            return self.run_recc_movie(cx, r, movie);
+        }
+        let pitch = word(RECC_DESTINATION_PITCH);
+        let (source, source_pitch, (lines, width), first) = match mode {
+            RECC_DEVELOP => (
+                address(RECC_SOURCE, RECC_SOURCE_HIGH),
+                word(RECC_SOURCE_PITCH),
+                size(RECC_BAND),
+                (word(RECC_SOURCE_LINE) >> 16, word(RECC_DESTINATION_LINE) >> 16),
+            ),
+            RECC_COPY => (
+                address(RECC_SECOND, RECC_SECOND_HIGH),
+                word(RECC_SECOND_PITCH),
+                size(RECC_SECOND_SIZE),
+                (0, 0),
+            ),
+            _ => (0, 0, (0, 0), (0, 0)),
+        };
+        let destination = address(RECC_DESTINATION, RECC_DESTINATION_HIGH) + first.1 * pitch;
+        let source = source + first.0 * source_pitch;
+        let end = destination + pitch * lines.saturating_sub(1) + 2 * width;
+        if source == 0
+            || lines < 6
+            || width < 6
+            || pitch < 4 * width.div_ceil(2)
+            || source_pitch < 2 * width
+            || destination < r.area.0
+            || end > r.area.0 + r.area.1
+        {
+            return Ok((source, destination, 0));
+        }
+        let bytes = cx.ram_bytes(source, (source_pitch * (lines - 1) + 2 * width) as usize)?;
+        let rows = if mode == RECC_DEVELOP {
+            let Some(offset) = source.checked_sub(r.raw.0) else {
+                return Ok((source, destination, 0));
+            };
+            let phase = (
+                (usize::from(r.site.0) + (offset / r.raw.1) as usize) % 6,
+                (usize::from(r.site.1) + (offset % r.raw.1 / 2) as usize) % 6,
+            );
+            match &self.recc_color {
+                None => crate::development::develop(
+                    &bytes,
+                    source_pitch as usize,
+                    lines as usize,
+                    width as usize,
+                    phase,
+                    None,
+                )?,
+                Some((tone, ycbcr, chroma_modes)) => {
+                    let ycbcr = ycbcr.lock().unwrap();
+                    let mut color =
+                        crate::development::FirmwareColor::from_words(&tone.lock().unwrap(), &ycbcr)?;
+                    if *chroma_modes {
+                        color = color.with_chroma_modes(&ycbcr);
+                    }
+                    if self.recc_chroma_matrix {
+                        color = color.with_chroma_matrix(&ycbcr);
+                    }
+                    if self.recc_brightness_gain {
+                        color = color.with_brightness_gain(&tone.lock().unwrap());
+                    }
+                    if self.recc_luma_bands {
+                        color = color.with_luma_bands(&ycbcr);
+                    }
+                    if let Some(reference) = self.recc_white_balance {
+                        color = color.with_white_balance(&tone.lock().unwrap(), reference)?;
+                    }
+                    if let Some((control, blocks)) = &self.recc_lut3d {
+                        let mut table = BTreeMap::new();
+                        for (k, block) in blocks.iter().enumerate() {
+                            for (o, w) in block.lock().unwrap().iter() {
+                                table.insert(0x1000 * k as u64 + o, *w);
+                            }
+                        }
+                        color = color.with_lut3d(&control.lock().unwrap(), &table);
+                    }
+                    crate::development::develop_firmware(
+                        &bytes,
+                        source_pitch as usize,
+                        lines as usize,
+                        width as usize,
+                        phase,
+                        &color,
+                    )?
+                }
+            }
+        } else {
+            bytes
+                .chunks(source_pitch as usize)
+                .map(|row| row[..2 * width as usize].to_vec())
+                .collect()
+        };
+        for (y, row) in rows.iter().enumerate() {
+            cx.ram_write(destination + y as u64 * pitch, row)
+                .map_err(|e| format!("RECC picture outside RAM: {e}"))?;
+        }
+        Ok((source, destination, lines))
+    }
+    /// One RECC band of the 4K movie (see [`ReccMovie`]): its log entry
+    /// (first RAW line read, first picture row written, lines written).
+    fn run_recc_movie(&self, cx: &mut Cx<'_>, r: Recc, m: ReccMovie) -> Result<(u64, u64, u64), String> {
+        use crate::development::{YcLayout, developed_line, grey_line, yc_row};
+        let word = |o| u64::from(self.state.words.get(&o).copied().unwrap_or(0));
+        let address = |low, high| (word(high) & 3) << 32 | word(low);
+        let source_pitch = word(RECC_SOURCE_PITCH);
+        let source = address(RECC_SOURCE, RECC_SOURCE_HIGH) + (word(RECC_SOURCE_LINE) >> 16) * source_pitch;
+        let window = word(RECC_MOVIE_SOURCE_WIDTH);
+        let width = word(RECC_MOVIE_WIDTH);
+        let lines = word(RECC_MOVIE_LINES) >> 16;
+        let first = word(RECC_DESTINATION_LINE) >> 16;
+        let pitch = word(RECC_DESTINATION_PITCH);
+        let layout = match word(RECC_MOVIE_OUTPUT) & 3 {
+            3 => YcLayout::Y0l2,
+            0 => YcLayout::Lines,
+            _ => return Ok((source, address(RECC_DESTINATION, RECC_DESTINATION_HIGH), 0)),
+        };
+        let per_row = layout.lines();
+        let destination = address(RECC_DESTINATION, RECC_DESTINATION_HIGH) + first / per_row * pitch;
+        let rows = lines / per_row;
+        let row_bytes = width * 2 * per_row;
+        if address(RECC_SOURCE, RECC_SOURCE_HIGH) == 0
+            || window < 6
+            || width < 2
+            || width % 2 != 0
+            || width > window
+            || rows == 0
+            || first % per_row != 0
+            || lines % per_row != 0
+            || pitch < row_bytes
+            || source_pitch < 2 * window
+            || (m.color && window % 2 != 0)
+            || destination < r.area.0
+            || destination + pitch * (rows - 1) + row_bytes > r.area.0 + r.area.1
+        {
+            return Ok((source, destination, 0));
+        }
+        // RAW line (from `source`) of band line j: the same step down as across.
+        let raw_line = |j: u64| j * window / width;
+        let developed = if m.color {
+            let n = raw_line(lines - 1) + 1;
+            if n < 6 {
+                return Ok((source, destination, 0));
+            }
+            let bytes = cx.ram_bytes(source, (source_pitch * (n - 1) + 2 * window) as usize)?;
+            let Some(offset) = source.checked_sub(r.raw.0) else {
+                return Ok((source, destination, 0));
+            };
+            let phase = (
+                (usize::from(r.site.0) + (offset / r.raw.1) as usize) % 6,
+                (usize::from(r.site.1) + (offset % r.raw.1 / 2) as usize) % 6,
+            );
+            Some(crate::development::develop(
+                &bytes,
+                source_pitch as usize,
+                n as usize,
+                window as usize,
+                phase,
+                None,
+            )?)
+        } else {
+            None
+        };
+        let line = |cx: &Cx<'_>, j: u64| -> Result<Vec<[u16; 3]>, String> {
+            Ok(match &developed {
+                Some(developed) => developed_line(&developed[raw_line(j) as usize], window, width),
+                None => grey_line(
+                    &cx.ram_bytes(source + raw_line(j) * source_pitch, 2 * window as usize)?,
+                    window,
+                    width,
+                    m.shift,
+                ),
+            })
+        };
+        for n in 0..rows {
+            let upper = line(cx, n * per_row)?;
+            let lower = if per_row > 1 { line(cx, n * per_row + 1)? } else { Vec::new() };
+            cx.ram_write(destination + n * pitch, &yc_row(layout, &upper, &lower))
+                .map_err(|e| format!("RECC picture outside RAM: {e}"))?;
+        }
+        Ok((source, destination, lines))
+    }
     fn run_work(&self, cx: &mut Cx<'_>, work: Work) -> Result<(), String> {
         let word = |o| self.state.words.get(&o).copied().unwrap_or(0);
         let address = |o| u64::from(word(o));
         let stride = |o| word(o) as usize * 2;
         let (rows, destination, destination_stride) = match work {
+            Work::Recc(_) => return Err("RECC develops through its own path".into()),
+            Work::Audio => return Err("The audio converter converts through its own path".into()),
             Work::Develop { phase } => {
                 let (lines, width) = crate::development::size(word(DEVELOP_SIZE));
                 let source_stride = stride(DEVELOP_SOURCE_STRIDE);
@@ -763,7 +1303,13 @@ impl Block {
 }
 impl Device for Block {
     fn name(&self) -> &'static str {
-        "xpp-register-block"
+        if let Some(name) = self.own_name {
+            name
+        } else if matches!(self.work, Some(Work::Recc(_))) {
+            "xpp-recc"
+        } else {
+            "xpp-register-block"
+        }
     }
     fn read(&mut self, cx: &mut Cx<'_>, address: u64, size: u8) -> u64 {
         // XP4 byte-wide controllers (0xfff3e000) and SDHCI halfword fields
@@ -872,13 +1418,44 @@ impl Device for Block {
         if let Some(job) = self.job {
             if self.state.due.is_some_and(|at| at <= cx.now()) {
                 self.state.due = None;
-                if let Some(work) = self.work
+                if let Some(Work::Recc(r)) = self.work {
+                    match self.run_recc(cx, r) {
+                        Ok(entry) => {
+                            if self.state.recc.len() == RECC_LOG {
+                                self.state.recc.remove(0);
+                            }
+                            self.state.recc.push(entry);
+                            if self.state.recc_words.len() < RECC_WORDS {
+                                let words = self.state.words.clone();
+                                self.state.recc_words.push(words);
+                            }
+                        }
+                        Err(e) => return cx.fail(e),
+                    }
+                } else if let Some(Work::Audio) = self.work {
+                    match self.run_audio(cx) {
+                        Ok(Some(true)) => self.state.audio_converted += 1,
+                        Ok(Some(false)) => self.state.audio_skipped += 1,
+                        Ok(None) => {}
+                        Err(e) => return cx.fail(e),
+                    }
+                } else if let Some(work) = self.work
                     && let Err(e) = self.run_work(cx, work)
                 {
                     return cx.fail(e);
                 }
                 self.state.jobs += 1;
+                if job.status.is_none() && job.stop.is_none() {
+                    // Pulse job: the start bit clears, the edge line pulses.
+                    self.clear_start(job.start);
+                    cx.set_irq(job.irq, true);
+                    cx.set_irq(job.irq, false);
+                    return;
+                }
                 self.state.status |= job.status.map_or(1, |(_, mask)| mask);
+                if self.start_clears {
+                    self.clear_start(job.start);
+                }
                 cx.set_irq(job.irq, true);
             }
             return;
@@ -940,6 +1517,15 @@ impl Device for Block {
     }
 }
 impl Block {
+    fn clear_start(&mut self, (offset, mask): (u64, u32)) {
+        let word = self.state.words.get(&offset).copied().unwrap_or(0) & !mask;
+        if word == 0 {
+            self.state.words.remove(&offset);
+        } else {
+            self.state.words.insert(offset, word);
+        }
+        self.publish();
+    }
     fn check(&self, state: &State) -> Result<(), String> {
         let started = self.frames.is_some_and(|f| {
             let (offset, mask) = f.start;
@@ -1484,7 +2070,7 @@ mod tests {
             ticks: 10,
         };
         let block = || Block::new(0xfff98000, 0x1000, vec![(0, 1)], None).unwrap();
-        assert!(block().with_job(Job { stop: None, ..job }).is_err());
+        assert!(block().with_job(Job { status: Some((8, 1)), ..job }).is_err());
         let mut engine = block().with_job(job).unwrap();
         write(&mut engine, &mut h, 0xfff98004, 1);
         assert_eq!(engine.next_deadline(10), Some(20));
@@ -1498,6 +2084,344 @@ mod tests {
         assert_eq!(read(&mut engine, &mut h, 0xfff98000), 1);
         engine.restore(&saved).unwrap();
         assert_eq!(engine.state.status, 1);
+    }
+
+    #[test]
+    fn recc_white_balance_needs_the_firmware_color_and_a_nonzero_reference() {
+        let job = Job { start: (4, 1), status: None, stop: None, irq: 129, ticks: 10 };
+        let recc = Recc { raw: (0x3000, 40), site: (5, 1), area: (0x1000, 0x1000) };
+        let block = || {
+            Block::new(0xfff82000, 0x1000, vec![(0, 1)], None)
+                .unwrap()
+                .with_job(job)
+                .unwrap()
+                .with_work(Work::Recc(recc))
+                .unwrap()
+        };
+        let (tone, ycbcr): (Published, Published) = Default::default();
+        assert!(block().with_recc_white_balance([9149, 4822, 9309]).is_err());
+        let color = || block().with_recc_color(tone.clone(), ycbcr.clone(), false).unwrap();
+        assert!(color().with_recc_white_balance([9149, 0, 9309]).is_err());
+        let on = color().with_recc_white_balance([9149, 4822, 9309]).unwrap();
+        assert_eq!(on.recc_white_balance, Some([9149, 4822, 9309]));
+        assert_eq!(color().recc_white_balance, None);
+    }
+
+    #[test]
+    fn recc_develops_with_the_firmware_color_words_as_they_stand_at_each_job() {
+        use crate::development::XTRANS;
+        use fujimod_emulator_devices::test_host::advance;
+        const RECC: u64 = 0xfff82000;
+        const TONE: u64 = 0xfff86000;
+        const YCBCR: u64 = 0xfff87000;
+        let job = Job { start: (4, 1), status: None, stop: None, irq: 129, ticks: 10 };
+        let recc = Recc { raw: (0x3000, 40), site: (5, 1), area: (0x1000, 0x1000) };
+        let block = || Block::new(RECC, 0x1000, vec![(0, 1)], None).unwrap().with_job(job).unwrap();
+        let (tone_words, ycbcr_words): (Published, Published) = Default::default();
+        let mut tone = Block::new(TONE, 0x1000, vec![], None).unwrap().with_published(tone_words.clone());
+        let mut ycbcr =
+            Block::new(YCBCR, 0x1000, vec![], None).unwrap().with_published(ycbcr_words.clone());
+        assert!(block().with_recc_color(tone_words.clone(), ycbcr_words.clone(), false).is_err());
+        assert!(block()
+            .with_work(Work::Recc(recc))
+            .unwrap()
+            .with_recc_color(tone_words.clone(), tone_words.clone(), false)
+            .is_err());
+        let mut engine = block()
+            .with_work(Work::Recc(recc))
+            .unwrap()
+            .with_recc_color(tone_words.clone(), ycbcr_words.clone(), false)
+            .unwrap();
+        let mut declared = block().with_work(Work::Recc(recc)).unwrap();
+        let mut h = TestHost::new();
+        // The firmware programs both units through their registers.
+        let (t, c) = crate::development::tests::firmware_units();
+        for (o, v) in &t {
+            write(&mut tone, &mut h, TONE + o, *v);
+        }
+        for (o, v) in &c {
+            write(&mut ycbcr, &mut h, YCBCR + o, *v);
+        }
+        assert_eq!(*tone_words.lock().unwrap(), t);
+        // Red sites at a quarter of the range, green and blue sites at an
+        // eighth: a reddish grey.
+        for y in 0..20usize {
+            for x in 0..16usize {
+                let level = if XTRANS[(y + 5) % 6][(x + 1) % 6] == 0 { 4864 } else { 2944 };
+                let at = 0x3000 + y * 40 + x * 2;
+                h.ram[at..at + 2].copy_from_slice(&(level as u16).to_le_bytes());
+            }
+        }
+        let w = |e: &mut Block, h: &mut TestHost, o: u64, v: u32| write(e, h, RECC + o, v);
+        let band = |e: &mut Block, h: &mut TestHost, now: u64| {
+            w(e, h, 0x08, 0x62_0000);
+            w(e, h, 0x0c, 0x3000 + 2 * 40 + 4);
+            w(e, h, 0x14, 40);
+            w(e, h, 0x18, 6 << 16 | 12);
+            w(e, h, 0x1c, 0);
+            w(e, h, 0x54, 0);
+            w(e, h, 0x70, 0x1000);
+            w(e, h, 0x80, 32);
+            w(e, h, 0x04, 1);
+            advance(e, h, now);
+            (0..6).map(|y| h.ram[0x1000 + y * 32..0x1000 + y * 32 + 24].to_vec()).collect::<Vec<_>>()
+        };
+        let declared_rows = band(&mut declared, &mut h, 10);
+        let firmware = band(&mut engine, &mut h, 20);
+        assert_ne!(firmware, declared_rows);
+        let color = crate::development::FirmwareColor::from_words(&t, &c).unwrap();
+        let linear = |s: u32| ((s - 1024) * 16383 / (16383 - 1024)) as u16;
+        let [y, cb, cr] = color.pixel([linear(4864), linear(2944), linear(2944)]);
+        assert!(cr > 128 && cb < 128);
+        for row in &firmware {
+            for pair in row.chunks_exact(4) {
+                assert_eq!(pair, [y as u8, y as u8, cb as u8, cr as u8]);
+            }
+        }
+        // A halved red curve, written before the next job, is the one it uses.
+        for i in 0..16u64 {
+            let o = 0x224 + 4 * i;
+            write(&mut tone, &mut h, TONE + o, (t[&o] >> 1) & 0x7fff_7fff);
+        }
+        let halved = band(&mut engine, &mut h, 30);
+        assert!(halved[0][3] < firmware[0][3], "{:?} {:?}", halved[0], firmware[0]);
+        // The LUT unit: eight table blocks apart from the control block, and
+        // only after the firmware color.
+        let (control, table): (Published, Vec<Published>) =
+            (Default::default(), (0..8).map(|_| Default::default()).collect());
+        assert!(block()
+            .with_work(Work::Recc(recc))
+            .unwrap()
+            .with_recc_lut3d(control.clone(), table.clone())
+            .is_err());
+        let colored = || {
+            block()
+                .with_work(Work::Recc(recc))
+                .unwrap()
+                .with_recc_color(tone_words.clone(), ycbcr_words.clone(), false)
+                .unwrap()
+        };
+        assert!(colored().with_recc_lut3d(control.clone(), table[..7].to_vec()).is_err());
+        let mut aliased = table.clone();
+        aliased[3] = control.clone();
+        assert!(colored().with_recc_lut3d(control.clone(), aliased).is_err());
+        let mut lut = colored().with_recc_lut3d(control.clone(), table.clone()).unwrap();
+        // Disabled (no words yet): the plain firmware color of the halved curve.
+        assert_eq!(band(&mut lut, &mut h, 40), halved);
+        // The firmware's monochrome table, enabled: grey, Cb = Cr = 128.
+        let y = |r: u32, g: u32, b: u32| (306 * r + 601 * g + 117 * b) * 273 / 1024;
+        let (c, words) = crate::development::tests::lut_words(|r, g, b| [y(r, g, b); 3]);
+        *control.lock().unwrap() = c;
+        for (o, v) in words {
+            table[(o / 0x1000) as usize].lock().unwrap().insert(o % 0x1000, v);
+        }
+        let grey = band(&mut lut, &mut h, 50);
+        for row in &grey {
+            for pair in row.chunks_exact(4) {
+                assert!(pair[2].abs_diff(128) <= 1 && pair[3].abs_diff(128) <= 1, "{pair:?}");
+            }
+        }
+    }
+
+    #[test]
+    fn recc_develops_its_bands_then_copies_the_picture_into_place() {
+        use crate::development::XTRANS;
+        use fujimod_emulator_devices::test_host::advance;
+        const RECC: u64 = 0xfff82000;
+        let job = Job { start: (4, 1), status: None, stop: None, irq: 129, ticks: 10 };
+        // RAW 16 x 20 at 0x3000, pitch 40; picture area 0x1000..0x2000.
+        let recc = Recc { raw: (0x3000, 40), site: (5, 1), area: (0x1000, 0x1000) };
+        let block = || Block::new(RECC, 0x1000, vec![(0, 1)], None).unwrap().with_job(job).unwrap();
+        assert!(block().with_work(Work::Recc(Recc { site: (6, 0), ..recc })).is_err());
+        let mut engine = block().with_work(Work::Recc(recc)).unwrap();
+        assert_eq!(engine.name(), "xpp-recc");
+        let mut h = TestHost::new();
+        // Only red sites lit, the RAW's first sample at site (5, 1).
+        for y in 0..20usize {
+            for x in 0..16usize {
+                let red = XTRANS[(y + 5) % 6][(x + 1) % 6] == 0;
+                let at = 0x3000 + y * 40 + x * 2;
+                h.ram[at..at + 2].copy_from_slice(&(if red { 9216u16 } else { 1024 }).to_le_bytes());
+            }
+        }
+        let w = |e: &mut Block, h: &mut TestHost, o: u64, v: u32| write(e, h, RECC + o, v);
+        // Two bands of 6 lines x 12 pixels from RAW line 2, sample 2, written
+        // 2 lines and 2 pixels into the picture (pitch 32 at 0x1000).
+        let band = |e: &mut Block, h: &mut TestHost, line: u32, now: u64| {
+            w(e, h, 0x08, 0x62_0000);
+            w(e, h, 0x0c, 0x3000 + 2 * 40 + 4);
+            w(e, h, 0x14, 40);
+            w(e, h, 0x18, 6 << 16 | 12);
+            w(e, h, 0x1c, line << 16);
+            w(e, h, 0x54, line << 16);
+            w(e, h, 0x70, 0x1000 + 2 * 32 + 4);
+            w(e, h, 0x80, 32);
+            w(e, h, 0x04, 1);
+            advance(e, h, now);
+        };
+        band(&mut engine, &mut h, 0, 10);
+        band(&mut engine, &mut h, 6, 20);
+        assert_eq!(
+            engine.state.recc,
+            vec![(0x3054, 0x1044, 6), (0x3054 + 6 * 40, 0x1044 + 6 * 32, 6)]
+        );
+        for y in 0..12 {
+            let at = 0x1044 + y * 32;
+            for pair in h.ram[at..at + 24].chunks_exact(4) {
+                assert!(pair[3] > 200 && pair[2] < 128, "line {y}: {pair:?}");
+            }
+        }
+        // The copy job moves the 12 x 12 picture to the start of the area.
+        w(&mut engine, &mut h, 0x08, 2);
+        w(&mut engine, &mut h, 0x0c, 0);
+        w(&mut engine, &mut h, 0x3c, 0x1044);
+        w(&mut engine, &mut h, 0x4c, 32);
+        w(&mut engine, &mut h, 0x50, 12 << 16 | 12);
+        w(&mut engine, &mut h, 0x1c, 0);
+        w(&mut engine, &mut h, 0x54, 0);
+        w(&mut engine, &mut h, 0x70, 0x1000);
+        w(&mut engine, &mut h, 0x04, 1);
+        let developed: Vec<Vec<u8>> =
+            (0..12).map(|y| h.ram[0x1044 + y * 32..0x1044 + y * 32 + 24].to_vec()).collect();
+        advance(&mut engine, &mut h, 30);
+        assert_eq!(engine.state.recc[2], (0x1044, 0x1000, 12));
+        for (y, row) in developed.iter().enumerate() {
+            assert_eq!(&h.ram[0x1000 + y * 32..0x1000 + y * 32 + 24], &row[..]);
+        }
+        // A destination outside the area is logged, not written.
+        w(&mut engine, &mut h, 0x70, 0x8000);
+        w(&mut engine, &mut h, 0x04, 1);
+        advance(&mut engine, &mut h, 40);
+        assert_eq!(engine.state.recc[3], (0x1044, 0x8000, 0));
+        assert_eq!(engine.state.jobs, 4);
+        assert_eq!(engine.state.recc_words.len(), 4);
+        let saved = engine.save();
+        engine.restore(&saved).unwrap();
+        assert_eq!(engine.state.recc.len(), 4);
+    }
+
+    #[test]
+    fn recc_movie_scales_two_bands_of_the_raw_into_y0l2_rows() {
+        use crate::development::y0l2_sample;
+        use fujimod_emulator_devices::test_host::advance;
+        const RECC: u64 = 0xfff82000;
+        let job = Job { start: (4, 1), status: None, stop: None, irq: 129, ticks: 10 };
+        let recc = Recc { raw: (0x3000, 32), site: (5, 1), area: (0x1000, 0x1000) };
+        let movie = ReccMovie { shift: 2, color: false };
+        let block = || Block::new(RECC, 0x1000, vec![(0, 1)], None).unwrap().with_job(job).unwrap();
+        assert!(block().with_recc_movie(movie).is_err(), "RECC only");
+        let recc_block = || block().with_work(Work::Recc(recc)).unwrap();
+        assert!(recc_block().with_recc_movie(ReccMovie { shift: 17, ..movie }).is_err());
+        // RAW 16 x 18 at 0x3000, pitch 32: sample = 50 * line + column.
+        let raw = |h: &mut TestHost| {
+            for y in 0..18usize {
+                for x in 0..16usize {
+                    let at = 0x3000 + y * 32 + x * 2;
+                    h.ram[at..at + 2].copy_from_slice(&((50 * y + x) as u16).to_le_bytes());
+                }
+            }
+        };
+        let w = |e: &mut Block, h: &mut TestHost, o: u64, v: u32| write(e, h, RECC + o, v);
+        // A band: RAW lines from `first_in`, 8 samples a line, onto `lines` picture lines of
+        // 6 pixels from `first_out` (pitch 32 at 0x1000): the 3/4 step of the 4K movie.
+        let band = |e: &mut Block, h: &mut TestHost, first_in: u32, first_out: u32, lines: u32, now: u64| {
+            w(e, h, 0x08, 0x42_2000);
+            w(e, h, 0x0c, 0x3000);
+            w(e, h, 0x14, 32);
+            w(e, h, 0x1c, first_in << 16);
+            w(e, h, 0x20, 8);
+            w(e, h, 0x24, (lines * 4 / 3) << 16);
+            w(e, h, 0x50, lines << 16);
+            w(e, h, 0x54, first_out << 16);
+            w(e, h, 0x58, 6);
+            w(e, h, 0x70, 0x1000);
+            w(e, h, 0x80, 32);
+            w(e, h, 0x04, 1);
+            advance(e, h, now);
+        };
+        // Without the movie mode, RECC writes nothing in mode 0x422000.
+        let mut plain = recc_block();
+        let mut h = TestHost::new();
+        raw(&mut h);
+        band(&mut plain, &mut h, 2, 0, 8, 10);
+        assert_eq!(plain.state.recc[0].2, 0);
+        assert!(h.ram[0x1000..0x2000].iter().all(|&b| b == 0));
+        // Y0L2: band 1 writes lines 0..8 from RAW line 2, band 2 lines 6..12 from RAW line 10;
+        // the two lines they share come out the same.
+        // Output code (+0x6c bits 1..0) 3: Y0L2 line pairs, as X-T3 5.11 programs it.
+        let mut engine = recc_block().with_recc_movie(movie).unwrap();
+        let mut h = TestHost::new();
+        raw(&mut h);
+        w(&mut engine, &mut h, 0x6c, 3);
+        band(&mut engine, &mut h, 2, 0, 8, 10);
+        let shared: Vec<u8> = h.ram[0x1000 + 3 * 32..0x1000 + 4 * 32].to_vec();
+        band(&mut engine, &mut h, 10, 6, 6, 20);
+        assert_eq!(engine.state.recc, vec![(0x3000 + 2 * 32, 0x1000, 8), (0x3000 + 10 * 32, 0x1000 + 3 * 32, 6)]);
+        assert_eq!(h.ram[0x1000 + 3 * 32..0x1000 + 4 * 32], shared[..]);
+        for y in 0..12usize {
+            for x in 0..6usize {
+                let row = &h.ram[0x1000 + y / 2 * 32..];
+                let want = (50 * (2 + y * 8 / 6) + x * 8 / 6) as u16;
+                assert_eq!(y0l2_sample(row, x, y % 2), (want, 512, 512), "line {y} pixel {x}");
+            }
+        }
+        assert!(h.ram[0x1000 + 6 * 32..0x2000].iter().all(|&b| b == 0), "nothing past the picture");
+        // Output code 0 (8-bit 4:2:2, the still's): one line a row, samples >> 2.
+        // Code 1 (8-bit 4:2:0) is not modeled: logged, nothing written.
+        let mut engine = recc_block().with_recc_movie(movie).unwrap();
+        let mut h = TestHost::new();
+        raw(&mut h);
+        band(&mut engine, &mut h, 2, 1, 8, 10);
+        assert_eq!(h.ram[0x1020..0x1024], [25, 25, 128, 128]);
+        assert_eq!(h.ram[0x1040..0x1044], [37, 37, 128, 128]);
+        w(&mut engine, &mut h, 0x6c, 1);
+        let before = h.ram[0x1000..0x2000].to_vec();
+        band(&mut engine, &mut h, 2, 1, 8, 20);
+        assert_eq!(engine.state.recc[1], (0x3000 + 2 * 32, 0x1000, 0));
+        assert_eq!(h.ram[0x1000..0x2000], before[..]);
+        // A band whose rows leave the area (line 512: row 256 at 0x3000) is logged, not written.
+        let mut engine = recc_block().with_recc_movie(movie).unwrap();
+        let mut h = TestHost::new();
+        raw(&mut h);
+        w(&mut engine, &mut h, 0x6c, 3);
+        band(&mut engine, &mut h, 2, 512, 8, 10);
+        assert_eq!(engine.state.recc, vec![(0x3000 + 2 * 32, 0x3000, 0)]);
+        assert!(h.ram[0x1000..0x2000].iter().all(|&b| b == 0));
+    }
+
+    #[test]
+    fn a_block_may_report_under_its_own_name_and_keeps_its_words() {
+        let mut plain = Block::new(0xfff83000, 0x1000, vec![], None).unwrap();
+        assert_eq!(plain.name(), "xpp-register-block");
+        let mut named = Block::new(0xfff83000, 0x1000, vec![], None).unwrap().with_own_name();
+        assert_eq!(named.name(), "xpp-register-block@0xfff83000");
+        let mut h = TestHost::new();
+        for block in [&mut plain, &mut named] {
+            write(block, &mut h, 0xfff83004, 0x400);
+            assert_eq!(read(block, &mut h, 0xfff83004), 0x400);
+        }
+        assert_eq!(plain.save(), named.save());
+    }
+
+    #[test]
+    fn a_pulse_job_clears_its_start_bit_and_pulses_its_edge_line() {
+        use fujimod_emulator_devices::test_host::advance;
+        // X-T3 5.11 0xfffa8000: +0x00 bit 0 idle; +0x04 bit 0 starts a job
+        // (0x1091630 returns at once, GIC 144; 0x1091150 polls bit 0 to 0).
+        const ENGINE: u64 = 0xfffa8000;
+        let job = Job { start: (4, 1), status: None, stop: None, irq: 144, ticks: 10 };
+        let mut engine = Block::new(ENGINE, 0x1000, vec![(0, 1)], None).unwrap().with_job(job).unwrap();
+        let mut h = TestHost::new();
+        write(&mut engine, &mut h, ENGINE + 0x10, 0x13eef80);
+        write(&mut engine, &mut h, ENGINE + 4, 1);
+        assert_eq!(read(&mut engine, &mut h, ENGINE + 4), 1);
+        advance(&mut engine, &mut h, 10);
+        assert_eq!(read(&mut engine, &mut h, ENGINE + 4), 0);
+        assert_eq!(read(&mut engine, &mut h, ENGINE + 0x10), 0x13eef80);
+        assert_eq!(read(&mut engine, &mut h, ENGINE), 1);
+        assert_eq!(engine.state.jobs, 1);
+        assert_eq!(engine.state.status, 0);
+        assert_eq!(engine.next_deadline(10), None);
     }
 
     #[test]
@@ -1654,5 +2578,120 @@ mod tests {
         assert_eq!(read(&mut engine, &mut h, 0xfffc30dc), 0x0100_0100);
         write(&mut engine, &mut h, 0xfffc30d8, 4);
         assert_eq!(read(&mut engine, &mut h, 0xfffc30d8), 4);
+    }
+
+    #[test]
+    fn a_status_job_may_clear_its_start_bit_when_it_ends() {
+        use fujimod_emulator_devices::test_host::advance;
+        // X-T3 5.11 IIFP 0xfff6f000: start +0x00 bit 0 beside idle bit 31,
+        // done +0x84 bit 0, GIC 134.
+        const IIFP: u64 = 0xfff6f000;
+        let job = Job {
+            start: (0, 1),
+            status: Some((0x84, 1)),
+            stop: None,
+            irq: 134,
+            ticks: 10,
+        };
+        let block = || Block::new(IIFP, 0x1000, vec![(0, 0x8000_0000)], None).unwrap();
+        assert!(block().with_start_clearing().is_err());
+        let pulse = Job { status: None, ..job };
+        assert!(block().with_job(pulse).unwrap().with_start_clearing().is_err());
+        let mut iifp = block().with_job(job).unwrap().with_start_clearing().unwrap();
+        let mut h = TestHost::new();
+        write(&mut iifp, &mut h, IIFP, 0x10 | 1);
+        assert_eq!(read(&mut iifp, &mut h, IIFP), 0x8000_0011);
+        advance(&mut iifp, &mut h, 10);
+        assert_eq!(iifp.state.status, 1);
+        assert_eq!(read(&mut iifp, &mut h, IIFP), 0x8000_0010);
+        // 0x1dbb6c8's read-modify-write does not start a second job.
+        let word = read(&mut iifp, &mut h, IIFP) as u32;
+        write(&mut iifp, &mut h, IIFP, word & !0x8000_0000 | 0x20);
+        assert_eq!(iifp.next_deadline(10), None);
+        write(&mut iifp, &mut h, IIFP + 0x84, 1);
+        assert_eq!(iifp.state.status, 0);
+        assert_eq!(iifp.state.jobs, 1);
+        // Without the option the start bit stays set, as before.
+        let mut held = block().with_job(job).unwrap();
+        write(&mut held, &mut h, IIFP, 1);
+        advance(&mut held, &mut h, 20);
+        assert_eq!(read(&mut held, &mut h, IIFP), 0x8000_0001);
+    }
+
+    #[test]
+    fn audio_converter_left_justifies_24_bit_playback_samples_into_32_bit_slots() {
+        use fujimod_emulator_devices::test_host::advance;
+        const A: u64 = 0xfffa8000;
+        let job = Job { start: (4, 1), status: None, stop: None, irq: 144, ticks: 10 };
+        let block = || Block::new(A, 0x1000, vec![(0, 1)], None).unwrap().with_job(job).unwrap();
+        assert!(Block::new(A, 0x1000, vec![(0, 1)], None).unwrap().with_work(Work::Audio).is_err());
+        let mut converter = block().with_work(Work::Audio).unwrap();
+        let mut plain = block();
+        let mut h = TestHost::new();
+        // Two lines of eight stereo frames, 24-bit packed: frame n has left
+        // n + 1 and right 0xa00000 + n (negative samples).
+        for n in 0..16u32 {
+            let at = 0x2000 + 6 * n as usize;
+            h.ram[at..at + 3].copy_from_slice(&(n + 1).to_le_bytes()[..3]);
+            h.ram[at + 3..at + 6].copy_from_slice(&(0xa0_0000 + n).to_le_bytes()[..3]);
+        }
+        let w = |e: &mut Block, h: &mut TestHost, o: u64, v: u32| write(e, h, A + o, v);
+        // 0x1091150: loading the firmware table converts nothing.
+        for (o, v) in [(0x0c, 0), (0x10, 0x013e_ef80), (0x08, 0), (0x04, 1)] {
+            w(&mut converter, &mut h, o, v);
+        }
+        advance(&mut converter, &mut h, 10);
+        assert!(h.ram[0x4000..0x4080].iter().all(|&b| b == 0));
+        // 0x1091220 then 0x1091630, as run LV111i traced the first job (two
+        // lines instead of 90).
+        let start = |e: &mut Block, h: &mut TestHost, lines: u32| {
+            for (o, v) in [
+                (0x08, 0x0300_0201),
+                (0x14, 0),
+                (0x18, 0x2000),
+                (0x1c, 0x30),
+                (0x20, lines),
+                (0x24, 0),
+                (0x28, 0x4000),
+                (0x2c, 0x40),
+                (0x30, 2),
+                (0x34, 0x0030_0030),
+                (0x38, 0x0040_0040),
+                (0x3c, 1),
+                (0x40, 5),
+                (0x44, 0x25),
+                (0x04, 1),
+            ] {
+                w(e, h, o, v);
+            }
+        };
+        start(&mut plain, &mut h, 2);
+        advance(&mut plain, &mut h, 30);
+        assert!(h.ram[0x4000..0x4080].iter().all(|&b| b == 0));
+        start(&mut converter, &mut h, 2);
+        advance(&mut converter, &mut h, 50);
+        let slot = |h: &TestHost, at: usize| u32::from_le_bytes(h.ram[at..at + 4].try_into().unwrap());
+        for n in 0..16u32 {
+            let at = 0x4000 + 8 * n as usize;
+            assert_eq!(slot(&h, at), (n + 1) << 8);
+            assert_eq!(slot(&h, at + 4), (0xa0_0000 + n) << 8);
+        }
+        assert_eq!(slot(&h, 0x4080), 0);
+        assert_eq!((converter.state.audio_converted, converter.state.audio_skipped), (1, 0));
+        // Lines that do not match: left alone and counted.
+        h.ram[0x4000..0x4080].fill(0);
+        start(&mut converter, &mut h, 3);
+        advance(&mut converter, &mut h, 70);
+        assert!(h.ram[0x4000..0x4080].iter().all(|&b| b == 0));
+        assert_eq!((converter.state.audio_converted, converter.state.audio_skipped), (1, 1));
+        let saved = converter.save();
+        converter.restore(&saved).unwrap();
+        assert_eq!(converter.state.audio_skipped, 1);
+        // The other widths, and recording's 32 to 24 bits.
+        assert_eq!(convert_audio(&[0x22, 0x33, 0x44], 3, 4), [0, 0x22, 0x33, 0x44]);
+        assert_eq!(convert_audio(&[0x33, 0x44], 2, 4), [0, 0, 0x33, 0x44]);
+        assert_eq!(convert_audio(&[0x11, 0x22, 0x33, 0x44], 4, 3), [0x22, 0x33, 0x44]);
+        assert_eq!(convert_audio(&[0x11, 0x22, 0x33, 0x44], 4, 2), [0x33, 0x44]);
+        assert_eq!(convert_audio(&[0x22, 0x33, 0x44, 0x55], 2, 3), [0, 0x22, 0x33, 0, 0x44, 0x55]);
     }
 }

@@ -248,6 +248,8 @@ fn i2c_controller_restores_with_its_parts() {
         width: 2,
         little_endian: true,
         registers: [(0x10, 0x1234)].into(),
+        counters: Vec::new(),
+        interrupt: None,
     };
     let mut bus = Controller::new(options.clone(), i2c::Parts::new(vec![part()]).unwrap()).unwrap();
     let mut host = TestHost::new();

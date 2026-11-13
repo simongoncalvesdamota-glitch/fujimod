@@ -53,6 +53,8 @@ pub struct PowerSerial {
     active_high: bool,
     idle: bool,
     inputs: BTreeMap<u8, u16>,
+    /// Declared words moved mid-run (`set_input`); they read before `inputs`.
+    moved: BTreeMap<u8, u16>,
     registers: BTreeMap<(bool, u8), u16>,
     edge: u64,
     phase: u8,
@@ -77,9 +79,12 @@ impl PowerSerial {
             // 13 and 27 are read-only status words X-T3 5.11 reads after the
             // first-start page (13 under semaphore 0x8f, 27 by the battery
             // monitor 0x10a1d90); their values are explicit body inputs.
+            // 48..=55 hold the 16-byte settings header the firmware keeps in
+            // the power controller (0x1124598 -> 0x10a33e8 writes 0x30..0x37):
+            // a body that already finished first start declares it.
             || inputs
                 .keys()
-                .any(|k| !matches!(*k, 0..=6 | 13 | 16 | 24 | 27 | 32 | 34 | 35))
+                .any(|k| !matches!(*k, 0..=6 | 13 | 16 | 24 | 27 | 32 | 34 | 35 | 48..=55))
             || [0, 1, 2, 3, 32, 34, 35]
                 .iter()
                 .any(|n| !inputs.contains_key(n))
@@ -102,6 +107,7 @@ impl PowerSerial {
             active_high,
             idle,
             inputs,
+            moved: BTreeMap::new(),
             registers: BTreeMap::new(),
             edge: 0,
             phase: 0,
@@ -114,6 +120,9 @@ impl PowerSerial {
     /// Words the firmware writes through 10a20d4. X-T3 5.11 also writes 13,
     /// 14, 16, 17 and 37 after the first-start page; a written word reads back
     /// its last write, an unwritten one its declared input (or 0).
+    fn input(&self, register: u8) -> Option<&u16> {
+        self.moved.get(&register).or_else(|| self.inputs.get(&register))
+    }
     fn writable(register: u8) -> bool {
         matches!(register, 2 | 13 | 14 | 16 | 17 | 18 | 32 | 34 | 35 | 37 | 38 | 48..=55)
     }
@@ -161,9 +170,9 @@ impl Input for PowerSerial {
                     self.response = *self
                         .registers
                         .get(&(bank, register))
-                        .or_else(|| self.inputs.get(&register))
+                        .or_else(|| self.input(register))
                         .unwrap_or(&0);
-                } else if let Some(v) = self.inputs.get(&register) {
+                } else if let Some(v) = self.input(register) {
                     self.response = *v;
                 } else {
                     return Err(format!("Unsupported power SPI read register{register}"));
@@ -204,7 +213,7 @@ impl Input for PowerSerial {
     }
     fn save(&self) -> Value {
         json!({"kind":"power-registers","port":self.port,"pin":self.pin,"active_high":self.active_high,
-        "idle":self.idle,"inputs":self.inputs,"registers":self.registers.iter().map(|(&(b,r),&v)|(b,r,v)).collect::<Vec<_>>(),
+        "idle":self.idle,"inputs":self.inputs,"moved":self.moved,"registers":self.registers.iter().map(|(&(b,r),&v)|(b,r,v)).collect::<Vec<_>>(),
         "phase":self.phase,"header":self.header,"high":self.high,"response":self.response,"edge":self.edge,"rtc":self.rtc})
     }
     fn restore(&mut self, value: &Value) -> Result<(), String> {
@@ -217,6 +226,8 @@ impl Input for PowerSerial {
             active_high: bool,
             idle: bool,
             inputs: BTreeMap<u8, u16>,
+            #[serde(default)]
+            moved: BTreeMap<u8, u16>,
             registers: Vec<(bool, u8, u16)>,
             phase: u8,
             header: u8,
@@ -237,6 +248,10 @@ impl Input for PowerSerial {
             || state.active_high != self.active_high
             || state.idle != self.idle
             || state.inputs != self.inputs
+            || state
+                .moved
+                .keys()
+                .any(|r| Self::writable(*r) || !self.inputs.contains_key(r))
             || state.rtc.0.ticks_per_second != self.rtc.0.ticks_per_second
             || state.phase > 2
             || registers.len() != state.registers.len()
@@ -246,6 +261,7 @@ impl Input for PowerSerial {
         {
             return Err("Invalid power SPI checkpoint or physical input".into());
         }
+        self.moved = state.moved;
         self.registers = registers;
         self.phase = state.phase;
         self.header = state.header;
@@ -254,6 +270,20 @@ impl Input for PowerSerial {
         self.edge = state.edge;
         self.rtc = state.rtc;
         Ok(())
+    }
+    /// A declared read-only word the outside world drives. X-T3 5.11: word 0
+    /// is the key group the firmware samples through 10a1d40 (group 0), bit 10
+    /// the power switch (0x8080 = ON, 0x8480 = OFF). Words the firmware writes
+    /// keep their own law, and ADC words stay 10-bit.
+    fn set_input(&mut self, register: u8, value: u16) -> Result<bool, String> {
+        if Self::writable(register)
+            || !self.inputs.contains_key(&register)
+            || ((3..=6).contains(&register) && value > 1023)
+        {
+            return Err(format!("Power SPI input {register} cannot change mid-run"));
+        }
+        self.moved.insert(register, value);
+        Ok(true)
     }
 }
 
@@ -350,6 +380,71 @@ mod tests {
             1 << 21,
         );
         assert_eq!(resumed.exchange(8, 0, 11).unwrap(), 0);
+    }
+    #[test]
+    fn a_declared_settings_header_reads_back_until_the_firmware_rewrites_it() {
+        let pins = Pins::new([0; 16]);
+        let mut gpio = Gpio::new(BASE, pins.clone()).unwrap();
+        let base = [(0, 0), (1, 0), (2, 0), (3, 512), (32, 0), (34, 0), (35, 0)];
+        let mut inputs: BTreeMap<u8, u16> = base.into();
+        inputs.insert(50, 2000);
+        inputs.insert(54, 28);
+        let mut peer =
+            PowerSerial::new(pins.clone(), 12, 5, true, false, inputs, 54_000_000).unwrap();
+        let mut beyond: BTreeMap<u8, u16> = base.into();
+        beyond.insert(56, 1);
+        assert!(PowerSerial::new(pins, 12, 5, true, false, beyond, 54_000_000).is_err());
+        gpio.write(
+            &mut Cx::new(&mut Clock, 0, 0, 0),
+            BASE + 12 * 64,
+            4,
+            (1 << 21) | (1 << 5),
+        );
+        let read = |peer: &mut PowerSerial, register: u8| {
+            peer.exchange(8, u16::from(register) << 2, 0).unwrap();
+            let high = peer.exchange(8, 0, 0).unwrap();
+            high << 8 | peer.exchange(8, 0, 0).unwrap()
+        };
+        assert_eq!(read(&mut peer, 50), 2000);
+        assert_eq!(read(&mut peer, 54), 28);
+        assert_eq!(read(&mut peer, 49), 0);
+        // The firmware's own write wins over the declared value.
+        for byte in [54 * 4 + 1, 0, 30] {
+            peer.exchange(8, byte, 0).unwrap();
+        }
+        assert_eq!(read(&mut peer, 54), 30);
+    }
+    #[test]
+    fn the_power_switch_word_changes_mid_run_and_survives_a_checkpoint() {
+        let pins = Pins::new([0; 16]);
+        let mut gpio = Gpio::new(BASE, pins.clone()).unwrap();
+        let inputs: BTreeMap<u8, u16> =
+            [(0, 0x8080), (1, 0), (2, 0), (3, 512), (32, 0), (34, 0), (35, 0)].into();
+        let mut peer =
+            PowerSerial::new(pins.clone(), 12, 5, true, false, inputs.clone(), 54_000_000).unwrap();
+        gpio.write(
+            &mut Cx::new(&mut Clock, 0, 0, 0),
+            BASE + 12 * 64,
+            4,
+            (1 << 21) | (1 << 5),
+        );
+        let read = |peer: &mut PowerSerial, register: u8| {
+            peer.exchange(8, u16::from(register) << 2, 0).unwrap();
+            let high = peer.exchange(8, 0, 0).unwrap();
+            high << 8 | peer.exchange(8, 0, 0).unwrap()
+        };
+        assert_eq!(read(&mut peer, 0), 0x8080);
+        // X-T3 5.11: bit 10 of key group 0 is the power switch.
+        assert_eq!(peer.set_input(0, 0x8480), Ok(true));
+        assert_eq!(read(&mut peer, 0), 0x8480);
+        // Firmware-written, undeclared and out-of-range ADC words are refused.
+        assert!(peer.set_input(2, 1).is_err());
+        assert!(peer.set_input(5, 1).is_err());
+        assert!(peer.set_input(3, 1024).is_err());
+        let saved = peer.save();
+        let mut resumed = PowerSerial::new(pins, 12, 5, true, false, inputs, 54_000_000).unwrap();
+        resumed.restore(&saved).unwrap();
+        assert_eq!(read(&mut resumed, 0), 0x8480);
     }
     #[test]
     fn physical_selection_frames_latches_and_unknown_commands() {

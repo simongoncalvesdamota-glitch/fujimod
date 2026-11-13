@@ -32,6 +32,14 @@ impl<T: Device> Device for Connected<T> {
     fn set_scene(&mut self, scene: &serde_json::Value) -> Result<bool, String> {
         self.0.lock().unwrap().set_scene(scene)
     }
+    fn set_i2c_registers(
+        &mut self,
+        base: u64,
+        address: u16,
+        registers: &BTreeMap<u8, u16>,
+    ) -> Result<bool, String> {
+        self.0.lock().unwrap().set_i2c_registers(base, address, registers)
+    }
     fn finish(&mut self) -> Result<(), String> {
         self.0.lock().unwrap().finish()
     }
@@ -53,9 +61,15 @@ pub struct Devices {
     pub log: Vec<Record>,
     prior_records: usize,
     pins: Option<fujimod_emulator_ip::socionext::gpio::SharedPins>,
+    gpio_irqs: Vec<(usize, usize, u32, u32)>,
+    gpio_irq_levels: bool,
     adc: Option<(usize, Arc<Mutex<Adc>>)>,
     xpp_adc: Option<Arc<Mutex<fujimod_emulator_xpp::adc::Converter>>>,
     usb: Option<Arc<Mutex<Dwc3>>>,
+    /// The imaging sensor, for laws a plan changes between slices.
+    imaging_sensor: Option<fujimod_emulator_sensor_input::sensor::Sensor>,
+    /// The statistics scene of the imaging block, for MOVDC scene pictures.
+    imaging_scene: Option<fujimod_emulator_sensor_input::statistics::Statistics>,
     pub frames: BTreeMap<usize, Frame>,
     pub outputs: BTreeMap<usize, serde_json::Value>,
     /// Earliest event or model deadline, cached when `due` found nothing due.
@@ -128,6 +142,23 @@ impl Host for PhysicalHost<'_> {
             }
             state.cache_dirty = true;
         }
+        if self.cluster.counted {
+            // Counted engines track their translated code byte by byte: tell
+            // each one which DRAM/window bytes changed (DRAM identity 0 for the
+            // alias), instead of discarding every translation at the flush.
+            let identity = match self.cluster.dram_alias {
+                Some(alias)
+                    if address >= alias && address - alias < self.cluster.ram.len() as u64 =>
+                {
+                    address - alias
+                }
+                _ => address,
+            };
+            let pointer = std::ptr::NonNull::new(target).ok_or("Null device RAM target")?;
+            for cpu in &self.cluster.cpus {
+                unsafe { cpu.backing_written(identity, pointer, bytes.len()) }?;
+            }
+        }
         Ok(())
     }
     fn scanout(&mut self, frame: Frame) -> Result<(), String> {
@@ -171,22 +202,237 @@ impl Devices {
             .unwrap()
             .set_input(&mut Cx::new(&mut host, 0, 0, *id), channel, sample)
     }
-    pub fn set_gpio_input(&mut self, port: usize, pin: usize, high: bool) -> Result<(), String> {
+    /// Sets an outside GPIO level; returns the GIC line its edge pulses, if
+    /// the pin is wired to one and the level changed.
+    pub fn set_gpio_input(
+        &mut self,
+        port: usize,
+        pin: usize,
+        high: bool,
+    ) -> Result<Option<u32>, String> {
         self.changed();
         if port >= 16 || pin >= 16 {
             return Err("Invalid XP4 external GPIO pin".into());
         }
-        self.pins
+        let mut pins = self
+            .pins
             .as_ref()
             .ok_or("XP4 GPIO inputs are not wired")?
             .lock()
-            .unwrap()
-            .set_input(port, pin, high);
+            .unwrap();
+        let was = pins.input(port, pin);
+        pins.set_input(port, pin, high);
+        Ok(self
+            .gpio_irqs
+            .iter()
+            .find(|&&(p, n, _, _)| (p, n) == (port, pin))
+            .map(|&(_, _, falling, rising)| if high { rising } else { falling })
+            .filter(|&line| was != high && line != 0))
+    }
+    /// Switches the GPIO interrupt wiring from edge pulses to line levels.
+    pub fn gpio_irq_levels(&mut self) -> Result<(), String> {
+        if self.gpio_irqs.is_empty() {
+            return Err("GPIO interrupt levels need GPIO interrupt lines".into());
+        }
+        self.gpio_irq_levels = true;
         Ok(())
+    }
+    /// With line levels on, the (line, level) pairs a wired pin at `high`
+    /// drives: the rising line is asserted while the pin is high, the
+    /// falling line while it is low. `None` when levels are off or the pin
+    /// is not wired.
+    pub fn gpio_line_levels(&self, port: usize, pin: usize, high: bool) -> Option<Vec<(u32, bool)>> {
+        if !self.gpio_irq_levels {
+            return None;
+        }
+        self.gpio_irqs
+            .iter()
+            .find(|&&(p, n, _, _)| (p, n) == (port, pin))
+            .map(|&(_, _, falling, rising)| {
+                [(falling, !high), (rising, high)]
+                    .into_iter()
+                    .filter(|&(line, _)| line != 0)
+                    .collect()
+            })
+    }
+    /// The lens ready line (`storage_dma_lens.motion_end`): a model sharing
+    /// the GPIO pins, driving the ready pin's interrupt lines by level.
+    pub fn lens_motion(&mut self, config: crate::definition::LensMotionEnd) -> Result<(), String> {
+        let pins = self
+            .pins
+            .clone()
+            .ok_or("The lens motion end requires GPIO wiring")?;
+        if self.models.iter().flatten().any(|m| m.name() == "lens-motion-end") {
+            return Err("One lens motion end per board".into());
+        }
+        let lines = match self
+            .gpio_irqs
+            .iter()
+            .find(|&&(p, n, _, _)| (p, n) == config.pin)
+        {
+            Some(&(_, _, falling, rising)) if self.gpio_irq_levels => (falling, rising),
+            Some(_) => {
+                return Err("The lens motion end drives its interrupt lines by level: set gpio_irq_levels".into());
+            }
+            None => (0, 0),
+        };
+        let model = crate::lens_motion::LensMotion::new(config, pins, lines)?;
+        self.changed();
+        self.models.push(Some(Box::new(model)));
+        Ok(())
+    }
+    pub fn gpio_irqs(&mut self, wiring: Vec<(usize, usize, u32, u32)>) -> Result<(), String> {
+        if self.pins.is_none() || !self.gpio_irqs.is_empty() {
+            return Err("GPIO interrupt lines need one GPIO wiring".into());
+        }
+        let mut seen = BTreeSet::new();
+        for &(port, pin, falling, rising) in &wiring {
+            if port >= 16
+                || pin >= 16
+                || !seen.insert((port, pin))
+                || [falling, rising]
+                    .iter()
+                    .any(|&line| line != 0 && !(32..512).contains(&line))
+            {
+                return Err("Invalid GPIO interrupt line wiring".into());
+            }
+        }
+        self.gpio_irqs = wiring;
+        Ok(())
+    }
+    /// Hands a new scene to every model that draws one (the imaging statistics);
+    /// returns how many took it.
+    pub fn set_scene(&mut self, scene: &serde_json::Value) -> Result<usize, String> {
+        self.changed();
+        let mut taken = 0;
+        for model in self.models.iter_mut().flatten() {
+            if model.set_scene(scene)? {
+                taken += 1;
+            }
+        }
+        Ok(taken)
+    }
+    /// Sets declared registers of an I2C target on the F_I2C channel at `base`, mid-run.
+    pub fn set_i2c_registers(
+        &mut self,
+        base: u64,
+        address: u16,
+        registers: &BTreeMap<u8, u16>,
+    ) -> Result<(), String> {
+        self.changed();
+        for model in self.models.iter_mut().flatten() {
+            if model.set_i2c_registers(base, address, registers)? {
+                return Ok(());
+            }
+        }
+        Err(format!("No F_I2C channel at {base:#x}"))
+    }
+    /// Moves an outside-driven word of a serial part (the power controller's
+    /// key group 0 holds the power switch), mid-run.
+    /// Encoder pulses into a channel of the 16-channel timer used as a counter
+    /// (see `Timers16::add_count`).
+    pub fn add_timer_count(&mut self, channel: usize, delta: i32) -> Result<u32, String> {
+        self.changed();
+        for model in self.models.iter_mut().flatten() {
+            let any: &mut dyn std::any::Any = model.as_mut();
+            if let Some(t) = any.downcast_mut::<fujimod_emulator_xp4_io::timers16::Timers16>() {
+                return t.add_count(channel, delta);
+            }
+        }
+        Err("XP4 16-channel timer is not wired".into())
+    }
+    pub fn set_power_input(&mut self, register: u8, value: u16) -> Result<(), String> {
+        self.changed();
+        for model in self.models.iter_mut().flatten() {
+            let any: &mut dyn std::any::Any = model.as_mut();
+            if let Some(spi) = any.downcast_mut::<fujimod_emulator_xp4_io::spi::Spi>() {
+                if spi.set_input(register, value)? {
+                    return Ok(());
+                }
+            }
+        }
+        Err("No serial part drives this input".into())
+    }
+    /// Declares a scripted answer on the PL011 UART at `base` (a test
+    /// hypothesis about the far end, see `pl011`).
+    pub fn uart_reply(&mut self, base: u64, when: Vec<u8>, answer: Vec<u8>) -> Result<(), String> {
+        self.changed();
+        for model in self.models.iter_mut().flatten() {
+            let any: &mut dyn std::any::Any = model.as_mut();
+            if let Some(uart) = any.downcast_mut::<fujimod_emulator_xp4_io::pl011::Pl011>() {
+                if uart.base() == base {
+                    return uart.add_reply(when, answer);
+                }
+            }
+        }
+        Err("No PL011 UART at this base".into())
+    }
+    /// Every non-zero sector of the SD card in the host at `base`, as
+    /// (LBA, 512 bytes), in LBA order (for inspecting what the guest wrote).
+    pub fn card_sectors(&self, base: u64) -> Result<Vec<(u32, Vec<u8>)>, String> {
+        let mut hosts = Vec::new();
+        for (id, model) in self.models.iter().enumerate() {
+            let Some(model) = model else { continue };
+            let any: &dyn std::any::Any = model.as_ref();
+            if let Some(host) = any.downcast_ref::<fujimod_emulator_ip::sdhci::host::SdHost>() {
+                let mapped = self
+                    .windows
+                    .iter()
+                    .any(|&(lo, hi, w)| w == id && lo <= base && base < hi.max(lo + 0x1000));
+                hosts.push((mapped, host));
+            }
+        }
+        let host = match hosts.iter().find(|(mapped, _)| *mapped) {
+            Some((_, host)) => *host,
+            None if hosts.len() == 1 => hosts[0].1,
+            None => return Err(format!("No SD host at this base ({} hosts)", hosts.len())),
+        };
+        Ok(host
+            .card()
+            .nonzero_sectors()
+            .map(|(lba, bytes)| (lba, bytes.to_vec()))
+            .collect())
+    }
+    /// Declares the input buffer's memory read-back law (event bits of +0x0c,
+    /// ticks): a test hypothesis about which event ends a still read-back.
+    pub fn input_readback(&mut self, event: u32, ticks: u64) -> Result<(), String> {
+        self.changed();
+        for model in self.models.iter_mut().flatten() {
+            let any: &mut dyn std::any::Any = model.as_mut();
+            if let Some(input) =
+                any.downcast_mut::<fujimod_emulator_sensor_input::input_buffer::InputBuffer>()
+            {
+                return input.set_readback(event, ticks);
+            }
+        }
+        Err("No input buffer wired".into())
+    }
+    /// Attaches an RL78 flash loader (Protocol A) to the PL011 at `base`.
+    pub fn uart_rl78(
+        &mut self,
+        base: u64,
+        signature: [u8; fujimod_emulator_xp4_io::rl78::SIGNATURE],
+        echo: bool,
+    ) -> Result<(), String> {
+        self.changed();
+        for model in self.models.iter_mut().flatten() {
+            let any: &mut dyn std::any::Any = model.as_mut();
+            if let Some(uart) = any.downcast_mut::<fujimod_emulator_xp4_io::pl011::Pl011>() {
+                if uart.base() == base {
+                    return uart.attach_rl78(signature, echo);
+                }
+            }
+        }
+        Err("No PL011 UART at this base".into())
     }
     pub fn gpio_registers(&self) -> Option<Vec<[u32; 8]>> {
         let pins = self.pins.as_ref()?.lock().unwrap();
         Some((0..16).map(|port| pins.registers(port)).collect())
+    }
+    /// Register-1 writes that cleared one GPIO pin so far.
+    pub fn gpio_releases(&self, port: usize, pin: usize) -> Option<u64> {
+        (port < 16 && pin < 16).then_some(())?;
+        Some(self.pins.as_ref()?.lock().unwrap().releases(port, pin))
     }
     pub fn gpio(&mut self, base: u64, inputs: [u16; 16]) -> Result<(), String> {
         if self.pins.is_some()
@@ -233,6 +479,7 @@ impl Devices {
         active_high: bool,
         inputs: BTreeMap<u8, u16>,
         rtc_ticks: u64,
+        gauge: Option<(u64, bool, usize, usize, bool, BTreeMap<u8, u16>, Vec<u8>)>,
     ) -> Result<(), String> {
         let pins = self
             .pins
@@ -240,7 +487,7 @@ impl Devices {
             .ok_or("Power SPI requires physical GPIO wiring")?
             .clone();
         let part = fujimod_emulator_xp4_io::power_serial::PowerSerial::new(
-            pins,
+            pins.clone(),
             port,
             pin,
             active_high,
@@ -248,7 +495,32 @@ impl Devices {
             inputs,
             rtc_ticks,
         )?;
-        self.spi_input(base, Box::new(part))
+        let Some((gauge_base, gauge_idle, gauge_port, gauge_pin, gauge_high, gauge_inputs, writable)) =
+            gauge
+        else {
+            return self.spi_input(base, Box::new(part));
+        };
+        // X-T3: the battery gauge shares the power controller's channel behind
+        // its own chip select; both idle low so the bus is their OR.
+        if gauge_base != base || idle || gauge_idle || (gauge_port, gauge_pin) == (port, pin) {
+            return Err("The XP4 gauge SPI needs the power channel, a distinct chip select and low idle levels".into());
+        }
+        let gauge = fujimod_emulator_xp4_io::gauge_serial::GaugeSerial::new(
+            pins,
+            gauge_port,
+            gauge_pin,
+            gauge_high,
+            gauge_idle,
+            gauge_inputs,
+            writable,
+        )?;
+        self.spi_input(
+            base,
+            Box::new(fujimod_emulator_xp4_io::spi::SharedBus(vec![
+                Box::new(part),
+                Box::new(gauge),
+            ])),
+        )
     }
 
     pub fn checksum_power_spi(
@@ -451,7 +723,27 @@ impl Devices {
         self.models.push(Some(Box::new(model)));
         Ok(())
     }
-    pub fn movdc(&mut self, outputs: Vec<(u64, u32, u64, u64, u8)>) -> Result<(), String> {
+    pub fn movdc(
+        &mut self,
+        outputs: Vec<(u64, u32, u64, u64, u8)>,
+        picture: Option<fujimod_emulator_sensor_input::statistics::ViewPicture>,
+        yuv420: bool,
+    ) -> Result<(), String> {
+        let source = match picture {
+            None => None,
+            Some(law) => {
+                law.check()?;
+                let scene = self
+                    .imaging_scene
+                    .clone()
+                    .ok_or("The MOVDC scene picture needs the imaging block")?;
+                let source: fujimod_emulator_xp4_display::movdc::Source =
+                    Arc::new(move |width, height| {
+                        scene.paint_view(width as usize, height as usize, &law)
+                    });
+                Some(source)
+            }
+        };
         for (base, irq, reset, period, luma) in outputs {
             if self
                 .windows
@@ -460,9 +752,15 @@ impl Devices {
             {
                 return Err("Overlapping XP4 MOVDC window".into());
             }
-            let model =
+            let mut model =
                 fujimod_emulator_xp4_display::movdc::Movdc::new(base, irq, reset, period, luma)?
                     .latch_configuration();
+            if let Some(source) = &source {
+                model = model.with_source(source.clone());
+            }
+            if yuv420 {
+                model = model.accept_yuv420();
+            }
             let id = self.models.len();
             self.models.push(Some(Box::new(model)));
             self.windows.push((base, base + 0x10c, id));
@@ -475,8 +773,34 @@ impl Devices {
         timing: (u64, u64, u64, u64),
         read_gate: (u16, u8),
         ibuf: Option<(u64, u32, u64, u64, u64, String)>,
+        start_pulse: Option<(u32, u32)>,
+        statistics_window: Option<u64>,
+        dma: Option<[u32; 2]>,
+        input_events: Option<u32>,
+        still_readout: Option<fujimod_emulator_sensor_input::slvs::StillReadout>,
+        raw_scene: bool,
+        line_pitch: bool,
+        tg_cadence: Option<fujimod_emulator_sensor_input::sensor::TgCadence>,
+        exposure: Option<fujimod_emulator_sensor_input::sensor::SensorExposure>,
+        statistics_outputs: Option<fujimod_emulator_sensor_input::statistics::StatisticsOutputs>,
     ) -> Result<(), String> {
         use fujimod_emulator_sensor_input::{sensor, slvs};
+        if statistics_outputs.is_some() && ibuf.is_none() {
+            return Err("Statistics outputs need the input buffer and its SRAM".into());
+        }
+        if exposure.is_some() && !raw_scene {
+            return Err("A sensor exposure law needs the RAW scene".into());
+        }
+        if raw_scene && (ibuf.is_none() || dma.is_none()) {
+            return Err("A RAW scene needs the input buffer scene and read-out DMA".into());
+        }
+        if statistics_window.is_some() && ibuf.is_none() {
+            return Err("A statistics window needs the input buffer and its SRAM".into());
+        }
+        let input_events = input_events.unwrap_or(0);
+        if input_events & !0xff != 0 || (input_events != 0 && ibuf.is_none()) {
+            return Err("Input-buffer event bits are 0..7 and need the input buffer".into());
+        }
         let (command_base, receiver_base, normal_irqs, error_irqs, timing_irqs) = map;
         let (period, active, command_ticks, reset_ticks) = timing;
         if command_base != 0xfff6c000
@@ -494,12 +818,25 @@ impl Devices {
         }
         let sensor = sensor::Sensor::new(
             Some(sensor::ImageRoutes {
-                dma: None,
+                dma,
                 timing: timing_irqs.try_into().unwrap(),
                 latch_unrouted: true,
+                start_pulse,
             }),
             read_gate,
         );
+        let painter = sensor.clone();
+        self.imaging_sensor = Some(sensor.clone());
+        if line_pitch {
+            if dma.is_none() {
+                return Err("A read-out line pitch needs the read-out DMA".into());
+            }
+            painter.use_line_pitch();
+        }
+        if let Some(cadence) = tg_cadence {
+            // Checked again here: the definition deserializes the rates as is.
+            painter.use_tg_cadence(sensor::TgCadence::new(cadence.clock_hz, cadence.tick_hz)?);
+        }
         let command = sensor::Command::new(command_base, sensor.clone(), command_ticks)?;
         let mut receiver = slvs::Receiver::new(
             sensor,
@@ -507,7 +844,10 @@ impl Devices {
                 base: receiver_base,
                 normal_irqs,
                 error_irqs,
-                output_channels: vec![],
+                // With routed read-out DMA, each frame end serves both
+                // channels; a channel runs only when its read-out is requested
+                // (X-T3 5.11 still capture arms channel 0).
+                output_channels: if dma.is_some() { vec![0, 1] } else { vec![] },
                 timing_output: true,
                 control: slvs::Control {
                     run_mask: 0x11,
@@ -519,6 +859,9 @@ impl Devices {
             period,
             active,
         )?;
+        if let Some(readout) = still_readout {
+            receiver = receiver.with_still_readout(readout)?;
+        }
         let mut extra: Vec<(u64, u64, Box<dyn Device>)> = vec![];
         if let Some((base, irq, reset, sram, bank_size, scene)) = ibuf {
             use fujimod_emulator_sensor_input::{
@@ -534,6 +877,39 @@ impl Devices {
                 return Err("Invalid XP4 input-buffer wiring".into());
             }
             let mut statistics = Statistics::new(sram, bank_size as usize)?;
+            if let Some(window) = statistics_window {
+                statistics = statistics.with_window(
+                    usize::try_from(window).map_err(|_| "statistics window overflows")?,
+                )?;
+            }
+            let window = statistics.window() as u64;
+            let mut outputs = vec![Output {
+                enable_word: 0,
+                bit: 0x100,
+                low: 0x254,
+                high: 0x258,
+                high_mask: 3,
+                columns: 16,
+                rows: 16,
+                planes: Planes::Rgb,
+            }];
+            if let Some(extra) = statistics_outputs {
+                extra.check()?;
+                // Same enable bit and frame as 0x254 (bit map unknown); each
+                // output reads its own destination pair (low, low + 4).
+                outputs.extend(extra.outputs().into_iter().map(|(low, columns, rows, planes)| {
+                    Output {
+                        enable_word: 0,
+                        bit: 0x100,
+                        low,
+                        high: low + 4,
+                        high_mask: 3,
+                        columns,
+                        rows,
+                        planes,
+                    }
+                }));
+            }
             statistics.set_scene(
                 &serde_json::from_str(&scene).map_err(|e| format!("statistics scene: {e}"))?,
             )?;
@@ -547,26 +923,30 @@ impl Devices {
                     max_offset: 0x2e8,
                     write_limit: 0x2e4,
                     ignore_undeclared: true,
-                    enables: [0x100, 0],
-                    causes: [0x100, 0],
-                    outputs: vec![Output {
-                        enable_word: 0,
-                        bit: 0x100,
-                        low: 0x254,
-                        high: 0x258,
-                        high_mask: 3,
-                        columns: 16,
-                        rows: 16,
-                        planes: Planes::Rgb,
-                    }],
+                    enables: [0x100 | input_events, 0],
+                    causes: [0x100 | input_events, 0],
+                    outputs,
                     reset_ticks: reset,
                     period_ticks: None,
                 },
                 Some(statistics.clone()),
             )?;
+            if raw_scene {
+                painter.paint_scene(statistics.clone());
+            }
+            if let Some(exposure) = exposure {
+                // Checked again here: the definition deserializes the code as is.
+                let mut law =
+                    sensor::SensorExposure::new(exposure.gain_ref, exposure.conversion_gain)?;
+                if let Some(shutter) = exposure.shutter {
+                    law = law.with_shutter(shutter)?;
+                }
+                painter.use_sensor_exposure(law)?;
+            }
+            self.imaging_scene = Some(statistics.clone());
             receiver = receiver.with_input_buffer(input.clone());
             extra.push((base, 0x2ec, Box::new(input)));
-            extra.push((sram, bank_size * 2, Box::new(statistics)));
+            extra.push((sram, window, Box::new(statistics)));
         }
         for (base, size, model) in [
             (command_base, 0x244, Box::new(command) as Box<dyn Device>),
@@ -588,6 +968,24 @@ impl Devices {
         }
         Ok(())
     }
+    /// Imaging frame periods withheld after each later timing generator
+    /// start (needs the cadence law); 0 = none.
+    pub fn set_standby_timing(&mut self) -> Result<(), String> {
+        self.imaging_sensor
+            .as_ref()
+            .ok_or("XP4 imaging is not wired")?
+            .use_standby_timing();
+        self.deadline = None;
+        Ok(())
+    }
+    pub fn set_tg_restart_delay(&mut self, frames: u32) -> Result<(), String> {
+        self.imaging_sensor
+            .as_ref()
+            .ok_or("XP4 imaging is not wired")?
+            .set_tg_restart_delay(frames)?;
+        self.deadline = None;
+        Ok(())
+    }
     pub fn empty() -> Self {
         Self {
             models: vec![],
@@ -596,9 +994,13 @@ impl Devices {
             log: vec![],
             prior_records: 0,
             pins: None,
+            gpio_irqs: Vec::new(),
+            gpio_irq_levels: false,
             adc: None,
             xpp_adc: None,
             usb: None,
+            imaging_sensor: None,
+            imaging_scene: None,
             frames: BTreeMap::new(),
             outputs: BTreeMap::new(),
             deadline: None,
@@ -650,6 +1052,8 @@ impl Devices {
         image: Vec<u8>,
         geometry: (usize, usize, u64, u64),
         irq: u32,
+        audio: Option<storage::AudioPacing>,
+        lens: Option<crate::definition::StorageDmaLens>,
     ) -> Result<Self, String> {
         let routes: [u32; 16] = routes
             .try_into()
@@ -673,15 +1077,28 @@ impl Devices {
         Ok(Self {
             models: vec![
                 Some(Box::new(SerialFlashController::new(port.clone(), irq))),
-                Some(Box::new(DmaController::new(port, routes))),
+                Some(Box::new({
+                    let dma = DmaController::new(port, routes).with_audio(audio)?;
+                    match lens {
+                        Some(l) => dma.with_peer(
+                            l.fifo,
+                            Box::new(fujimod_emulator_xp4_storage::lens_peer::XMountPeer::new(l.link)?),
+                        )?,
+                        None => dma,
+                    }
+                })),
             ],
             events: Default::default(),
             log: Vec::new(),
             prior_records: 0,
             pins: None,
+            gpio_irqs: Vec::new(),
+            gpio_irq_levels: false,
             adc: None,
             xpp_adc: None,
             usb: None,
+            imaging_sensor: None,
+            imaging_scene: None,
             frames: BTreeMap::new(),
             outputs: BTreeMap::new(),
             deadline: None,
@@ -1068,10 +1485,46 @@ impl Devices {
         self.windows.push((base, base + 0x1000, id));
         Ok(())
     }
+    /// A standard SDHCI host owning its whole 4 KiB page, with a FAT card.
+    pub fn sd_host(
+        &mut self,
+        sd: crate::definition::SdHostInput,
+        files: &[(String, Vec<u8>)],
+    ) -> Result<(), String> {
+        use fujimod_emulator_ip::sdhci::host::{SdHost, Wiring};
+        let base = sd.options.base;
+        if self
+            .windows
+            .iter()
+            .any(|&(lo, hi, _)| base < hi && lo < base.saturating_add(0x108))
+        {
+            return Err("Overlapping SDHCI host".into());
+        }
+        let card = fujimod_emulator_storage::fat::format(&sd.card, files)?;
+        let contacts = fujimod_emulator_devices::parts::card_contacts::Contacts::new(true, false);
+        let host = match sd.irq {
+            Some(irq) => SdHost::new(
+                sd.options,
+                Wiring {
+                    card,
+                    contacts,
+                    irq: fujimod_emulator_devices::bus::InterruptLine::Shared(irq),
+                },
+            )?,
+            None => SdHost::new_polled(sd.options, card, contacts)?,
+        };
+        let id = self.models.len();
+        self.models.push(Some(Box::new(host)));
+        // The SDHCI bank ends at +0x108; vendor words after it (X-T3 +0x1e0,
+        // +0x1e4) are declared separately, e.g. as a register block.
+        self.windows.push((base, base + 0x108, id));
+        Ok(())
+    }
     pub fn xpp_register_block(
         &mut self,
         block: crate::definition::XppRegisterBlock,
         image: Option<(u32, [u8; 3])>,
+        recc_units: &BTreeMap<u64, fujimod_emulator_xpp::blocks::Published>,
     ) -> Result<(), String> {
         let frames = block.frames.map(|f| fujimod_emulator_xpp::blocks::Frames {
             start: f.start,
@@ -1089,6 +1542,59 @@ impl Devices {
                 irq: j.irq,
                 ticks: j.ticks,
             })?;
+            if j.start_clears {
+                model = model.with_start_clearing()?;
+            }
+        }
+        if block.own_name {
+            model = model.with_own_name();
+        }
+        if let Some(words) = recc_units.get(&block.base) {
+            model = model.with_published(words.clone());
+        }
+        if block.audio_converter && block.recc.is_some() {
+            return Err("A register block is RECC or the audio converter, not both".into());
+        }
+        if let Some(r) = block.recc {
+            model = model.with_work(fujimod_emulator_xpp::blocks::Work::Recc(
+                fujimod_emulator_xpp::blocks::Recc {
+                    raw: r.raw,
+                    site: r.site,
+                    area: r.area,
+                },
+            ))?;
+            if let Some(m) = r.movie {
+                model = model
+                    .with_recc_movie(fujimod_emulator_xpp::blocks::ReccMovie { shift: m.shift, color: m.color })?;
+            }
+            if let Some(c) = r.firmware_color {
+                let unit = |base| {
+                    recc_units
+                        .get(&base)
+                        .cloned()
+                        .ok_or("a RECC firmware color unit is not declared")
+                };
+                model = model.with_recc_color(unit(c.tone)?, unit(c.ycbcr)?, c.chroma_modes)?;
+                if c.chroma_matrix {
+                    model = model.with_recc_chroma_matrix()?;
+                }
+                if c.brightness_gain {
+                    model = model.with_recc_brightness_gain()?;
+                }
+                if c.luma_bands {
+                    model = model.with_recc_luma_bands()?;
+                }
+                if let Some(reference) = c.white_balance {
+                    model = model.with_recc_white_balance(reference)?;
+                }
+                if let Some(l) = c.lut3d {
+                    let table = l.tables().map(unit).into_iter().collect::<Result<Vec<_>, _>>()?;
+                    model = model.with_recc_lut3d(unit(l.control)?, table)?;
+                }
+            }
+        }
+        if block.audio_converter {
+            model = model.with_work(fujimod_emulator_xpp::blocks::Work::Audio)?;
         }
         if !block.fixed.is_empty() {
             model = model.with_fixed(block.fixed)?;
@@ -1222,6 +1728,100 @@ impl Devices {
             .any(|&(lo, hi, _)| base < hi && lo < base.saturating_add(WINDOW))
         {
             return Err("Overlapping X-Processor Pro I2C bus".into());
+        }
+        let parts = fujimod_emulator_xpp::i2c::Parts::new(bus.parts)?;
+        let model = Controller::new(bus.options, parts)?;
+        let id = self.models.len();
+        self.models.push(Some(Box::new(model)));
+        self.windows.push((base, base + WINDOW, id));
+        Ok(())
+    }
+    pub fn job_ack(&mut self, options: fujimod_emulator_xpp::job_ack::Options) -> Result<(), String> {
+        let model = fujimod_emulator_xpp::job_ack::JobAck::new(options)?;
+        let windows = model.windows();
+        if windows.iter().any(|&(base, end)| {
+            self.windows.iter().any(|&(lo, hi, _)| base < hi && lo < end)
+        }) {
+            return Err("Overlapping acknowledged job page".into());
+        }
+        let id = self.models.len();
+        self.models.push(Some(Box::new(model)));
+        for (base, end) in windows {
+            self.windows.push((base, end, id));
+        }
+        Ok(())
+    }
+    pub fn mali_v61(&mut self, options: fujimod_emulator_xpp::mali_v61::Options) -> Result<(), String> {
+        let model = fujimod_emulator_xpp::mali_v61::MaliV61::new(options)?;
+        let windows = model.windows();
+        if windows.iter().any(|&(base, end)| {
+            self.windows.iter().any(|&(lo, hi, _)| base < hi && lo < end)
+        }) {
+            return Err("Overlapping Mali-V61 page".into());
+        }
+        let id = self.models.len();
+        self.models.push(Some(Box::new(model)));
+        for (base, end) in windows {
+            self.windows.push((base, end, id));
+        }
+        Ok(())
+    }
+    pub fn jpeg(&mut self, base: u64, irq: u32, ticks: u64, decoder: bool) -> Result<(), String> {
+        use fujimod_emulator_xpp::jpeg::{Decoder, Encoder, WINDOW};
+        if self
+            .windows
+            .iter()
+            .any(|&(lo, hi, _)| base < hi && lo < base.saturating_add(WINDOW))
+        {
+            return Err("Overlapping XP4 JPEG engine".into());
+        }
+        let model: Box<dyn fujimod_emulator_devices::Device> = if decoder {
+            Box::new(Decoder::new(base, irq, ticks)?)
+        } else {
+            Box::new(Encoder::new(base, irq, ticks)?)
+        };
+        let id = self.models.len();
+        self.models.push(Some(model));
+        self.windows.push((base, base + WINDOW, id));
+        Ok(())
+    }
+    pub fn pl011(&mut self, base: u64, irq: Option<u32>) -> Result<(), String> {
+        use fujimod_emulator_xp4_io::pl011::{Pl011, WINDOW};
+        if self
+            .windows
+            .iter()
+            .any(|&(lo, hi, _)| base < hi && lo < base.saturating_add(WINDOW))
+        {
+            return Err("Overlapping PL011 UART".into());
+        }
+        let id = self.models.len();
+        self.models.push(Some(Box::new(Pl011::new(base, irq)?)));
+        self.windows.push((base, base + WINDOW, id));
+        Ok(())
+    }
+    pub fn timers16(&mut self, base: u64, irq: u32) -> Result<(), String> {
+        use fujimod_emulator_xp4_io::timers16::{Timers16, WINDOW};
+        if self
+            .windows
+            .iter()
+            .any(|&(lo, hi, _)| base < hi && lo < base.saturating_add(WINDOW))
+        {
+            return Err("Overlapping XP4 16-channel timer".into());
+        }
+        let id = self.models.len();
+        self.models.push(Some(Box::new(Timers16::new(base, irq)?)));
+        self.windows.push((base, base + WINDOW, id));
+        Ok(())
+    }
+    pub fn fi2c(&mut self, bus: crate::definition::Fi2c) -> Result<(), String> {
+        use fujimod_emulator_ip::socionext::fi2c::{Controller, WINDOW};
+        let base = bus.options.base;
+        if self
+            .windows
+            .iter()
+            .any(|&(lo, hi, _)| base < hi && lo < base.saturating_add(WINDOW))
+        {
+            return Err("Overlapping XP4 F_I2C channel".into());
         }
         let parts = fujimod_emulator_xpp::i2c::Parts::new(bus.parts)?;
         let model = Controller::new(bus.options, parts)?;
@@ -1393,12 +1993,25 @@ impl Devices {
     pub fn changed(&mut self) {
         self.deadline = None;
     }
+    /// The next deadline, cached as `due` caches it when nothing is due by
+    /// `now` (a due deadline stays uncached for `due` to service).
+    pub fn settled_deadline(&mut self, now: u64) -> Option<u64> {
+        if let Some(cached) = self.deadline {
+            return cached;
+        }
+        let at = self.next_deadline(now);
+        if at.is_none_or(|at| at > now) {
+            self.deadline = Some(at);
+        }
+        at
+    }
+    /// Whether the cached deadline shows nothing due by `now`.
+    pub fn quiet(&self, now: u64) -> bool {
+        self.deadline.is_some_and(|at| at.is_none_or(|at| at > now))
+    }
     pub fn due(&mut self, c: &Cluster) -> Result<(), String> {
         let now = unsafe { (*c.state.get()).ticks };
-        if self
-            .deadline
-            .is_some_and(|at| at.is_none_or(|at| at > now))
-        {
+        if self.quiet(now) {
             return Ok(());
         }
         self.deadline = None;
@@ -1451,6 +2064,12 @@ impl Devices {
 
 impl Cluster {
     pub fn devices_due(&self) -> Result<(), String> {
+        // Same early exit as `Devices::due`, without moving the device set
+        // out of the run state and back (two large copies per instruction).
+        let now = unsafe { (*self.state.get()).ticks };
+        if unsafe { (*self.state.get()).devices.as_ref() }.is_some_and(|d| d.quiet(now)) {
+            return Ok(());
+        }
         let devices = unsafe { (*self.state.get()).devices.take() };
         if let Some(mut devices) = devices {
             let result = devices.due(self);
@@ -1500,7 +2119,9 @@ impl Cluster {
             state.remap_ready = false;
         }
         if unsafe { (*self.state.get()).cache_dirty } {
-            for cpu in &self.cpus {
+            // Counted engines already invalidated exactly the code a device
+            // write touched (`ram_write`); the redirect still ended the slice.
+            for cpu in self.cpus.iter().filter(|_| !self.counted) {
                 cpu.invalidate_code(None)?;
             }
             unsafe {

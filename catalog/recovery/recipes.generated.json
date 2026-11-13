@@ -13095,8 +13095,14 @@
             "name": "configuration working view",
             "address": 65437696,
             "size": 4718592
+          },
+          {
+            "name": "kernel buffers filled after reset (5 x 128 KiB, unit 0 0x56488)",
+            "address": 1196032,
+            "size": 655380
           }
         ],
+        "program_address": 14491648,
         "defaults": {
           "address": 13238272,
           "size": 524288,

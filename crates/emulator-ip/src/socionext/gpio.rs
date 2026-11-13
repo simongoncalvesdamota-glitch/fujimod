@@ -8,6 +8,11 @@ pub struct Pins {
     regs: [[u32; 8]; 16],
     inputs: [u16; 16],
     changes: [[u64; 16]; 16],
+    /// Writes to register 1 that clear a pin's bit through its mask (on the
+    /// X-T3 the pin's direction: the camera releases it). Kept out of saved
+    /// state so runs that never read it stay byte-identical.
+    #[serde(skip)]
+    releases: [[u64; 16]; 16],
 }
 pub type SharedPins = Arc<Mutex<Pins>>;
 impl Pins {
@@ -16,6 +21,7 @@ impl Pins {
             regs: [[0; 8]; 16],
             inputs,
             changes: [[0; 16]; 16],
+            releases: [[0; 16]; 16],
         }))
     }
     /// Register words of `port`, indexed by offset / 4.
@@ -27,6 +33,11 @@ impl Pins {
             self.regs[port][0] & (1 << pin) != 0,
             self.changes[port][pin],
         )
+    }
+    /// How many register-1 writes cleared `pin` of bank `port`, even when it
+    /// was already clear.
+    pub fn releases(&self, port: usize, pin: usize) -> u64 {
+        self.releases[port][pin]
     }
     /// Input level of a pin.
     pub fn input(&self, port: usize, pin: usize) -> bool {
@@ -100,6 +111,13 @@ impl Device for Gpio {
             let mask = v >> 16;
             (old & !mask) | (v & mask)
         };
+        if r == 1 {
+            for bit in 0..16 {
+                if (v >> 16) & (1 << bit) != 0 && v & (1 << bit) == 0 {
+                    pins.releases[p][bit] += 1;
+                }
+            }
+        }
         if r == 0 {
             for bit in 0..16 {
                 if (old ^ pins.regs[p][r]) & (1 << bit) != 0 {
@@ -135,8 +153,10 @@ impl Device for Gpio {
         saved: &fujimod_emulator_devices::checkpoint::Checkpoint,
     ) -> Result<(), String> {
         self.validate_checkpoint(saved)?;
-        let (_, pins): (u64, Pins) = saved.decode(self.name())?;
-        *self.pins.lock().map_err(|_| "GPIO pins poisoned")? = pins;
+        let (_, mut pins): (u64, Pins) = saved.decode(self.name())?;
+        let mut current = self.pins.lock().map_err(|_| "GPIO pins poisoned")?;
+        pins.releases = current.releases;
+        *current = pins;
         Ok(())
     }
     fn fingerprint(&self) -> Result<Value, String> {
@@ -171,5 +191,35 @@ mod tests {
             d.write(&mut cx, base + 2 * 64 + 0x14, 4, 0);
             assert!(cx.refusal().is_some());
         }
+    }
+    #[test]
+    fn register_one_writes_that_clear_a_pin_count_as_releases_outside_saved_state() {
+        // X-T3 5.11: 0x107159c(0xf0001, 0) writes 0x00020000 to port 15
+        // register 1 before each lens movement, the bit already clear.
+        let base = 0xfff41000;
+        let pins = Pins::new([0; 16]);
+        let mut d = Gpio::new(base, pins.clone()).unwrap();
+        let mut h = TestHost::new();
+        let before = d.save();
+        write(&mut d, &mut h, base + 15 * 64 + 4, 0x00020000);
+        write(&mut d, &mut h, base + 15 * 64 + 4, 0x00020000);
+        write(&mut d, &mut h, base + 15 * 64 + 4, 0x00020002);
+        write(&mut d, &mut h, base + 15 * 64 + 4, 0x00000000);
+        write(&mut d, &mut h, base + 15 * 64, 0x00020000);
+        assert_eq!(pins.lock().unwrap().releases(15, 1), 2);
+        assert_eq!(pins.lock().unwrap().releases(15, 0), 0);
+        let saved = d.checkpoint().unwrap();
+        write(&mut d, &mut h, base + 15 * 64 + 4, 0x00020000);
+        d.restore_checkpoint(&saved).unwrap();
+        assert_eq!(pins.lock().unwrap().releases(15, 1), 3);
+        write(&mut d, &mut h, base + 15 * 64 + 4, 0x00020000);
+        write(&mut d, &mut h, base + 15 * 64, 0x00000000);
+        let mut fresh = Gpio::new(base, Pins::new([0; 16])).unwrap();
+        write(&mut fresh, &mut h, base + 15 * 64 + 4, 0x00020002);
+        write(&mut fresh, &mut h, base + 15 * 64 + 4, 0x00020000);
+        // Same registers, different release counts: the count is not saved.
+        assert_eq!(before, d.save());
+        assert_eq!(fresh.save(), d.save());
+        assert_ne!(fresh.pins.lock().unwrap().releases(15, 1), pins.lock().unwrap().releases(15, 1));
     }
 }

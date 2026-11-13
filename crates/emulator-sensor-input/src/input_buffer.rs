@@ -47,7 +47,25 @@ struct State {
     frames: u64,
     deadline: Option<u64>,
     reset_deadline: Option<u64>,
+    /// Every enable bit the firmware set in +0x04 / +0x08, declared or not
+    /// (report only: undeclared bits arm nothing).
+    #[serde(default)]
+    requested: [u32; 2],
+    /// The last writes to the control words +0x00, +0x04, +0x08, +0x0c,
+    /// +0x224, +0x228 and +0x2e4, as (tick, offset, value) (report only).
+    #[serde(default)]
+    control_writes: std::collections::VecDeque<(u64, u64, u32)>,
+    /// Declared memory read-back law: (event bits of +0x0c, ticks). Writing 1
+    /// to +0x224 (X-T3 5.11 still capture; live view writes 0x80605) starts one
+    /// read-back of the RAW in RAM that ends after `ticks` with these bits.
+    #[serde(default)]
+    readback: Option<(u32, u64)>,
+    #[serde(default)]
+    readback_deadline: Option<u64>,
+    #[serde(default)]
+    readbacks: u64,
 }
+const CONTROL_WRITES: usize = 64;
 impl State {
     fn r(&self, o: u64) -> u32 {
         self.regs.get(&o).copied().unwrap_or(0)
@@ -60,6 +78,15 @@ pub struct InputBuffer {
     statistics: Option<Statistics>,
 }
 impl InputBuffer {
+    /// Declares the memory read-back law (a test hypothesis about which +0x0c
+    /// event ends a read-back; see `State::readback`).
+    pub fn set_readback(&self, event: u32, ticks: u64) -> Result<(), String> {
+        if event == 0 || event & !0xffff != 0 || ticks == 0 {
+            return Err("invalid input-buffer read-back law".into());
+        }
+        self.state.lock().unwrap().readback = Some((event, ticks));
+        Ok(())
+    }
     pub fn set_statistics(&mut self, statistics: Statistics) {
         self.statistics = Some(statistics);
     }
@@ -102,12 +129,20 @@ impl InputBuffer {
                 let address = u64::from(s.r(output.low))
                     | (u64::from(s.r(output.high) & output.high_mask) << 32);
                 if address == 0 {
-                    pending &= !(output.bit << (output.enable_word * 16));
+                    if output.planes.completes() {
+                        pending &= !(output.bit << (output.enable_word * 16));
+                    }
                 } else {
                     self.statistics
                         .as_ref()
                         .ok_or("input-buffer output has no statistics source")?
-                        .complete(cx, address, output.columns, output.rows, output.planes)?;
+                        .complete(
+                            cx,
+                            address,
+                            output.columns,
+                            output.rows,
+                            output.planes.resolve(|o| s.r(o)),
+                        )?;
                 }
             }
         }
@@ -166,6 +201,12 @@ impl Device for InputBuffer {
         }
         let value = value as u32;
         let mut s = self.state.lock().unwrap();
+        if matches!(o, 0 | 4 | 8 | 0xc | 0x224 | 0x228 | 0x2e4) {
+            if s.control_writes.len() == CONTROL_WRITES {
+                s.control_writes.pop_front();
+            }
+            s.control_writes.push_back((cx.now(), o, value));
+        }
         if o == 0 && value & 1 == 0 {
             s.generation = s.generation.wrapping_add(1);
             s.armed = false;
@@ -181,11 +222,22 @@ impl Device for InputBuffer {
                 s.reset_deadline = Some(at);
                 cx.schedule(at, s.generation);
             }
+        } else if o == 0x224 && value == 1 && s.readback.is_some() {
+            s.regs.insert(o, value);
+            let ticks = s.readback.unwrap().1;
+            let Some(at) = cx.now().checked_add(ticks) else {
+                cx.fail("input-buffer read-back overflow");
+                return;
+            };
+            s.readback_deadline = Some(at);
+            cx.schedule(at, s.generation);
         } else if o == self.wiring.status {
             let pending = s.r(o) & !value;
             s.regs.insert(o, pending);
         } else if matches!(o, 4 | 8) {
             let word = (o / 4 - 1) as usize;
+            let strobe = value >> 16;
+            s.requested[word] = (s.requested[word] & !strobe) | (value & strobe & 0xffff);
             if !self.wiring.ignore_undeclared
                 && value & (value >> 16) & !self.wiring.enables[word] != 0
             {
@@ -217,6 +269,14 @@ impl Device for InputBuffer {
             if s.reset_deadline.is_some_and(|at| at <= cx.now()) {
                 s.reset_deadline = None;
             }
+            if s.readback_deadline.is_some_and(|at| at <= cx.now()) {
+                s.readback_deadline = None;
+                s.readbacks += 1;
+                let event = s.readback.map_or(0, |r| r.0);
+                let pending = s.r(self.wiring.status) | event;
+                s.regs.insert(self.wiring.status, pending);
+                self.irq(&s, cx);
+            }
         }
         loop {
             let at = {
@@ -244,7 +304,11 @@ impl Device for InputBuffer {
     }
     fn next_deadline(&self, _: u64) -> Option<u64> {
         let s = self.state.lock().unwrap();
-        s.deadline.into_iter().chain(s.reset_deadline).min()
+        s.deadline
+            .into_iter()
+            .chain(s.reset_deadline)
+            .chain(s.readback_deadline)
+            .min()
     }
     fn save(&self) -> Value {
         serde_json::json!({"state":*self.state.lock().unwrap()})
@@ -255,6 +319,9 @@ impl Device for InputBuffer {
         if state.deadline.is_some() && (!state.armed || self.wiring.period_ticks.is_none()) {
             return Err("input-buffer clock/deadline disagree".into());
         }
+        if state.readback_deadline.is_some() && state.readback.is_none() {
+            return Err("input-buffer read-back without a law".into());
+        }
         *self.state.lock().unwrap() = state;
         Ok(())
     }
@@ -264,6 +331,85 @@ impl Device for InputBuffer {
 mod tests {
     use super::*;
     use fujimod_emulator_devices::test_host::recording::RecordingHost;
+    #[test]
+    fn undeclared_enable_bits_are_reported_but_arm_nothing() {
+        let mut input = InputBuffer::new(
+            Wiring {
+                base: 0x200000,
+                irq: 106,
+                status: 12,
+                irq_control: 0x2e4,
+                ready: 0x2e8,
+                max_offset: 0x2e8,
+                write_limit: 0x2e4,
+                ignore_undeclared: true,
+                enables: [0x100, 0],
+                causes: [0x100, 0],
+                outputs: vec![],
+                reset_ticks: 8,
+                period_ticks: None,
+            },
+            None,
+        )
+        .unwrap();
+        let mut host = RecordingHost::default();
+        // Strobe in the high half: set bits 0..5, then clear bit 2.
+        input.write(&mut Cx::new(&mut host, 0, 0, 0), 0x200004, 4, 0x003f_003f);
+        input.write(&mut Cx::new(&mut host, 0, 0, 0), 0x200004, 4, 0x0004_0000);
+        let s = input.state.lock().unwrap();
+        assert_eq!(s.requested, [0x3b, 0]);
+        assert_eq!(s.control_writes.len(), 2);
+        assert_eq!(s.control_writes[1].1, 4);
+        assert_eq!(s.r(4), 0);
+        assert!(!s.armed);
+    }
+
+    #[test]
+    fn a_memory_read_back_ends_once_with_its_declared_event() {
+        let mut input = InputBuffer::new(
+            Wiring {
+                base: 0x200000,
+                irq: 106,
+                status: 12,
+                irq_control: 0x2e4,
+                ready: 0x2e8,
+                max_offset: 0x2e8,
+                write_limit: 0x2e4,
+                ignore_undeclared: true,
+                enables: [0x100, 0],
+                causes: [0x100, 0],
+                outputs: vec![],
+                reset_ticks: 8,
+                period_ticks: None,
+            },
+            None,
+        )
+        .unwrap();
+        let mut host = RecordingHost::default();
+        // Without a law, +0x224 is a plain word.
+        input.write(&mut Cx::new(&mut host, 0, 0, 0), 0x200224, 4, 1);
+        assert_eq!(input.next_deadline(0), None);
+        input.set_readback(0x2, 100).unwrap();
+        assert!(input.set_readback(0, 100).is_err());
+        input.write(&mut Cx::new(&mut host, 0, 0, 0), 0x2002e4, 4, 0x120);
+        host.now = 10;
+        input.write(&mut Cx::new(&mut host, 0, 0, 0), 0x200224, 4, 1);
+        assert_eq!(input.next_deadline(10), Some(110));
+        let saved = input.save();
+        host.now = 110;
+        input.event(&mut Cx::new(&mut host, 0, 0, 0), 0);
+        assert_eq!(input.read(&mut Cx::new(&mut host, 0, 0, 0), 0x20000c, 4), 2);
+        assert_eq!(host.irqs.last(), Some(&(106, true)));
+        // Acknowledged once, it does not come back.
+        input.write(&mut Cx::new(&mut host, 0, 0, 0), 0x20000c, 4, 2);
+        assert_eq!(host.irqs.last(), Some(&(106, false)));
+        assert_eq!(input.next_deadline(110), None);
+        assert_eq!(input.state.lock().unwrap().readbacks, 1);
+        let mut resumed = input.clone();
+        resumed.restore(&saved).unwrap();
+        assert_eq!(resumed.next_deadline(10), Some(110));
+    }
+
     #[test]
     fn upstream_edges_dma_and_w1c_are_independent_of_program_and_early_service() {
         fn experiment(cpu: usize, pc: u64) -> Value {
@@ -355,5 +501,123 @@ mod tests {
             serde_json::json!([saved, pixels])
         }
         assert_eq!(experiment(0, 0x1000), experiment(3, 0xabcdef));
+    }
+
+    #[test]
+    fn statistics_outputs_fill_their_destinations_and_leave_the_status_alone() {
+        use crate::statistics::StatisticsOutputs;
+        fn bench(extra: bool) -> (InputBuffer, Statistics, RecordingHost) {
+            let mut statistics = Statistics::new(0x100000, 0x7000).unwrap();
+            statistics.set_scene(&serde_json::json!({"luma": 2048})).unwrap();
+            let mut outputs = vec![Output {
+                enable_word: 0,
+                bit: 0x100,
+                low: 0x254,
+                high: 0x258,
+                high_mask: 3,
+                columns: 16,
+                rows: 16,
+                planes: Planes::Rgb,
+            }];
+            if extra {
+                outputs.extend(StatisticsOutputs::default().outputs().into_iter().map(
+                    |(low, columns, rows, planes)| Output {
+                        enable_word: 0,
+                        bit: 0x100,
+                        low,
+                        high: low + 4,
+                        high_mask: 3,
+                        columns,
+                        rows,
+                        planes,
+                    },
+                ));
+            }
+            let mut input = InputBuffer::new(
+                Wiring {
+                    base: 0x200000,
+                    irq: 106,
+                    status: 12,
+                    irq_control: 0x2e4,
+                    ready: 0x2e8,
+                    max_offset: 0x2e8,
+                    write_limit: 0x2e4,
+                    ignore_undeclared: true,
+                    enables: [0x100, 0],
+                    causes: [0x100, 0],
+                    outputs,
+                    reset_ticks: 8,
+                    period_ticks: None,
+                },
+                Some(statistics.clone()),
+            )
+            .unwrap();
+            let mut host = RecordingHost::default();
+            host.now = 10;
+            input.write(&mut Cx::new(&mut host, 0, 0, 0), 0x200000, 4, 0);
+            host.now = 18;
+            input.event(&mut Cx::new(&mut host, 0, 0, 0), 1);
+            for (offset, value) in [(4, 0x1000100), (0x2e4, 0x120)] {
+                input.write(&mut Cx::new(&mut host, 0, 0, 0), 0x200000 + offset, 4, value);
+            }
+            (input, statistics, host)
+        }
+        let (mut stock, stock_stats, mut stock_host) = bench(false);
+        let (mut input, mut statistics, mut host) = bench(true);
+        let status = |input: &mut InputBuffer, host: &mut RecordingHost| {
+            input.read(&mut Cx::new(host, 0, 0, 0), 0x20000c, 4)
+        };
+        // Nothing programmed: the extra outputs withdraw no cause bit.
+        stock.frame(&mut Cx::new(&mut stock_host, 0, 0, 0)).unwrap();
+        input.frame(&mut Cx::new(&mut host, 0, 0, 0)).unwrap();
+        assert_eq!(status(&mut input, &mut host), status(&mut stock, &mut stock_host));
+        // 0x254 alone: same status, same SRAM, same checkpoint as the stock wiring.
+        for (bench_input, bench_host) in [(&mut stock, &mut stock_host), (&mut input, &mut host)] {
+            bench_input.write(&mut Cx::new(bench_host, 0, 0, 0), 0x200254, 4, 0x101060);
+            bench_input.frame(&mut Cx::new(bench_host, 0, 0, 0)).unwrap();
+        }
+        assert_eq!(status(&mut input, &mut host), 0x100);
+        assert_eq!(status(&mut stock, &mut stock_host), 0x100);
+        assert_eq!(statistics.save(), stock_stats.save());
+        assert_eq!(input.save(), stock.save());
+        // Every destination and black window programmed (Runs photo § 18 capture windows).
+        for (offset, value) in [
+            (0x244, 0x1021a0),
+            (0x25c, 0x102060),
+            (0x2b4, 0x106000),
+            (0x274, 0x1029a0),
+            (0x27c, 0x1029c0),
+            (0x284, 0x1029e0),
+            (0x1ac, 0x000c_0015),
+            (0x1b0, 0x0114_03ff),
+            (0x1b4, 0x0004_0007),
+            (0x1b8, 0x03ff),
+            (0x1bc, 0x0004_0007),
+            (0x1c0, 0x03ff),
+        ] {
+            input.write(&mut Cx::new(&mut host, 0, 0, 0), 0x200000 + offset, 4, value);
+        }
+        input.frame(&mut Cx::new(&mut host, 0, 0, 0)).unwrap();
+        assert_eq!(status(&mut input, &mut host), 0x100);
+        let mut read = |address: u64, size: u8| statistics.read(&mut Cx::new(&mut host, 0, 0, 0), address, size);
+        // Grid: (2048 << 2) >> 2 in the high half of every 7x7 zone, nothing beyond.
+        assert_eq!(read(0x1021a0, 4), 2048 << 16);
+        assert_eq!(read(0x1021a0 + 6 * 0x40 + 6 * 4, 4), 2048 << 16);
+        assert_eq!(read(0x1021a0 + 7 * 4, 4), 0);
+        // Records: band 0 sums over the firmware's 153 x 153 sites, black
+        // included; the other bands hold one site, hence no sample.
+        assert_eq!(read(0x102060, 8), 9216 * (23409 * 2 / 9));
+        assert_eq!(read(0x102068, 8), 9216 * (23409 * 5 / 9));
+        assert_eq!(read(0x102078, 8), 0);
+        assert_eq!(read(0x102080, 8), 0);
+        // Histogram: 64 x 64 points in class 8192 >> 6.
+        assert_eq!(read(0x106000 + 128 * 4, 4), 4096);
+        assert_eq!(read(0x106000 + 127 * 4, 4), 0);
+        // Black: 1024 x (22 x 1024 x 4) and 1024 x (8 x 1024 x 4) on all four channels.
+        assert_eq!(read(0x1029a0, 8), 0x580_0000);
+        assert_eq!(read(0x1029b8, 8), 0x580_0000);
+        assert_eq!(read(0x1029c0, 8), 0x200_0000);
+        assert_eq!(read(0x1029f8, 8), 0x200_0000);
+        assert!(host.ram.is_empty());
     }
 }

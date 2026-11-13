@@ -19,6 +19,9 @@ fn options(protocol: Protocol, initialization_fault: InitializationFault) -> Opt
         initialization_fault,
         high_speed: false,
         ram_banks: vec![],
+        capabilities: None,
+        line_levels: false,
+        write_protect_active_high: false,
     }
 }
 

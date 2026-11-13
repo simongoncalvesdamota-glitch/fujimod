@@ -235,6 +235,376 @@ fn byte(v: i32) -> u8 {
     v.clamp(0, 255) as u8
 }
 
+/// X-T3 5.11 firmware color of a RECC development (opt-in), read from the
+/// words the firmware programs for the still: the 3x3 Q10 matrix of tone unit
+/// 0xfff86000 (+0x204, rows 8 bytes apart, signed 13-bit halves), its three
+/// tone curves (+0x224, +0x264, +0x2a4: 31 points of 14 bits, one curve per
+/// R, G, B output) joined linearly over thirty segments, three per nibble of
+/// +0x21c/+0x220, each 2^n wide (only the ratios count, the 14-bit input spans
+/// their sum), then the Q10 RGB to YCbCr matrix
+/// of unit 0xfff87000 (+0x204: nine packed signed 13-bit halves, rows Y, Cb,
+/// Cr). Declared, not read: black and white levels ([`crate::imaging::BLACK`],
+/// [`crate::imaging::WHITE`]), no white-balance gains, linear joins between
+/// the points, curve output to bytes by its top 8 bits, chroma offset 128.
+#[derive(Clone, Debug, PartialEq)]
+pub struct FirmwareColor {
+    matrix: [[i32; 3]; 3],
+    /// One 14-bit input to byte lookup per output channel.
+    curves: [Vec<u8>; 3],
+    ycbcr: [[i32; 3]; 3],
+    /// Cb and Cr held constant, when [`Self::with_chroma_modes`] reads a
+    /// constant chroma mode.
+    chroma: [Option<i32>; 2],
+    /// Q10 2x2 matrix on the centred (Cb, Cr), when
+    /// [`Self::with_chroma_matrix`] reads it.
+    chroma_matrix: Option<[[i32; 2]; 2]>,
+    /// The same curves to 12-bit levels, read only by the 3D lookup table.
+    levels: [Vec<u16>; 3],
+    /// 16x16x16 RGB lookup table of 12-bit (R, G, B), when
+    /// [`Self::with_lut3d`] reads an enabled table.
+    lut: Option<Vec<[u16; 3]>>,
+    /// Q9 gain of each 14-bit brightness and the R, G, B brightness weights
+    /// (sum 32), when [`Self::with_brightness_gain`] reads them.
+    brightness: Option<(Vec<u16>, [i32; 3])>,
+    /// Luma band bounds and (slope, Q8 gain) of each band, when
+    /// [`Self::with_luma_bands`] reads them.
+    luma_bands: Option<([i32; 4], [(i32, i32); 5])>,
+    /// Q12 factors of the tone unit's per-channel gains relative to a
+    /// declared reference, normalized to green, when
+    /// [`Self::with_white_balance`] reads programmed gains.
+    white_balance: Option<[u32; 3]>,
+}
+const TONE_MATRIX: u64 = 0x204;
+const TONE_WIDTHS: u64 = 0x21c;
+const TONE_CURVES: [u64; 3] = [0x224, 0x264, 0x2a4];
+const YCBCR_MATRIX: u64 = 0x204;
+const YCBCR_CONTROL: u64 = 0x200;
+/// The YCbCr unit's 2x2 chroma words: lo halves the diagonal (Cb, Cr gains),
+/// hi halves the cross terms.
+const CHROMA_MATRIX: [u64; 2] = [0x238, 0x23c];
+/// The tone unit's brightness weights (+0x004: three 6-bit bytes, R, G, B)
+/// and gain table (+0x008: 40 points of 14 bits, two per word, low first).
+const TONE_WEIGHTS: u64 = 0x004;
+const TONE_GAIN: u64 = 0x008;
+/// Brightness span of each of the gain table's 13 cubic segments (sum 16384).
+const GAIN_WIDTHS: [i64; 13] = [4, 4, 8, 16, 32, 64, 128, 256, 512, 1024, 2048, 4096, 8192];
+/// The YCbCr unit's luma band bounds (+0x258: four bytes) and bands
+/// (+0x25c..+0x26c: five words, signed 11-bit slope low, 10-bit gain high).
+const LUMA_KNOTS: u64 = 0x258;
+const LUMA_BANDS: u64 = 0x25c;
+/// The tone unit's per-channel gains, R, G and B: the low and high halves of
+/// +0x088 and the low half of +0x08c.
+const TONE_GAINS: [(u64, u32); 3] = [(0x088, 0), (0x088, 16), (0x08c, 0)];
+/// Chroma mode value read as "constant chroma" (Cb: control bits 16-19,
+/// Cr: bits 20-23).
+const CHROMA_CONSTANT: u32 = 1;
+/// Nodes per axis of the 3D lookup table and their spacing in 12-bit levels
+/// (15 x 273 = 4095).
+const LUT_NODES: usize = 16;
+const LUT_STEP: i64 = 273;
+/// Table size in bytes: one (R, G, B, pad) u16 quadruple per node.
+pub const LUT_BYTES: u64 = (LUT_NODES * LUT_NODES * LUT_NODES * 8) as u64;
+
+fn signed13(v: u32) -> i32 {
+    ((v << 19) as i32) >> 19
+}
+
+/// Points joined linearly over segments `widths` wide, at `x / 16384`
+/// (rounded).
+fn joined(points: &[i64], widths: &[i64], x: i64) -> i64 {
+    let mut start = 0;
+    for (k, &width) in widths.iter().enumerate() {
+        let span = width << 14;
+        if x < start + span {
+            let rise = points[k + 1] - points[k];
+            return points[k] + (rise * (x - start) + span / 2).div_euclid(span);
+        }
+        start += span;
+    }
+    *points.last().unwrap()
+}
+
+/// Cubic Bezier segments `widths` wide, three control points each plus the
+/// end, at `x` (the integer law of the X70 film stage's brightness table).
+fn cubic(points: &[i64], widths: &[i64], x: i64) -> i64 {
+    let mut start = 0;
+    for (k, &width) in widths.iter().enumerate() {
+        if x < start + width {
+            let t = ((x - start) << 9) / width;
+            let u = 512 - t;
+            let p = &points[3 * k..3 * k + 4];
+            return (u * u * u * p[0]
+                + 3 * u * u * t * p[1]
+                + 3 * u * t * t * p[2]
+                + t * t * t * p[3]
+                + (1 << 26))
+                >> 27;
+        }
+        start += width;
+    }
+    *points.last().unwrap()
+}
+
+impl FirmwareColor {
+    /// The law of the tone unit's and the YCbCr unit's current words.
+    pub fn from_words(
+        tone: &BTreeMap<u64, u32>,
+        ycbcr: &BTreeMap<u64, u32>,
+    ) -> Result<Self, String> {
+        let t = |o: u64| tone.get(&o).copied().unwrap_or(0);
+        let c = |o: u64| ycbcr.get(&o).copied().unwrap_or(0);
+        let matrix: [[i32; 3]; 3] = std::array::from_fn(|row| {
+            let o = TONE_MATRIX + 8 * row as u64;
+            [signed13(t(o)), signed13(t(o) >> 16), signed13(t(o + 4))]
+        });
+        let half = |i: usize| signed13(c(YCBCR_MATRIX + 4 * (i / 2) as u64) >> (16 * (i % 2)));
+        let ycbcr: [[i32; 3]; 3] =
+            std::array::from_fn(|row| std::array::from_fn(|col| half(3 * row + col)));
+        if matrix.iter().any(|r| r == &[0; 3]) || ycbcr[0] == [0; 3] {
+            return Err("the firmware color units are not programmed".into());
+        }
+        let nibbles = u64::from(t(TONE_WIDTHS)) | u64::from(t(TONE_WIDTHS + 4)) << 32;
+        let widths: [i64; 30] = std::array::from_fn(|i| 1 << ((nibbles >> (4 * (i / 3))) & 15));
+        let domain: i64 = widths.iter().sum();
+        let joins = TONE_CURVES.map(|slot| {
+            let points: [i64; 31] = std::array::from_fn(|i| {
+                i64::from((t(slot + 4 * (i / 2) as u64) >> (16 * (i % 2))) & 16383)
+            });
+            (0..16384)
+                .map(|v| joined(&points, &widths, v * domain))
+                .collect::<Vec<i64>>()
+        });
+        let curves = std::array::from_fn(|c| {
+            joins[c].iter().map(|&v| (v >> 6).clamp(0, 255) as u8).collect()
+        });
+        let levels = std::array::from_fn(|c| {
+            joins[c].iter().map(|&v| (v >> 2).clamp(0, 4095) as u16).collect()
+        });
+        Ok(Self {
+            matrix,
+            curves,
+            ycbcr,
+            chroma: [None; 2],
+            chroma_matrix: None,
+            levels,
+            lut: None,
+            brightness: None,
+            luma_bands: None,
+            white_balance: None,
+        })
+    }
+    /// The same law with the chroma mode fields of the YCbCr unit's control
+    /// word (+0x200): a Cb (bits 16-19) or Cr (bits 20-23) mode of 1 holds
+    /// that component at the neutral 128. Declared, not proven: the meaning
+    /// of the fields (X-T3 5.11 ACROS sets both from 0 to 1 and the camera's
+    /// ACROS stills are monochrome) and the neutral constant.
+    pub fn with_chroma_modes(mut self, ycbcr: &BTreeMap<u64, u32>) -> Self {
+        let control = ycbcr.get(&YCBCR_CONTROL).copied().unwrap_or(0);
+        self.chroma = [16, 20].map(|shift| ((control >> shift) & 15 == CHROMA_CONSTANT).then_some(128));
+        self
+    }
+    /// The same law with the 2x2 chroma matrix of the YCbCr unit's words
+    /// (opt-in): +0x238 and +0x23c each hold two signed 13-bit halves, the
+    /// low ones the diagonal; centred (Cb, Cr) become
+    /// `(a Cb + b Cr, c Cb + d Cr) / 1024` with a = +0x238 lo, b = +0x238 hi,
+    /// c = +0x23c hi, d = +0x23c lo. Read, not declared: the register format
+    /// (X-T3 5.11 setter 0x1062e9c from the film parameters p+0x3c..+0x42,
+    /// identity default 1024/0/1024/0, zero for the monochrome films).
+    /// Declared, not proven: which axis is Cb and which Cr, the place of the
+    /// cross terms, Q10 and the place after the YCbCr matrix.
+    pub fn with_chroma_matrix(mut self, ycbcr: &BTreeMap<u64, u32>) -> Self {
+        let c = CHROMA_MATRIX.map(|o| ycbcr.get(&o).copied().unwrap_or(0));
+        self.chroma_matrix = Some([
+            [signed13(c[0]), signed13(c[0] >> 16)],
+            [signed13(c[1] >> 16), signed13(c[1])],
+        ]);
+        self
+    }
+    /// The same law with the brightness gain of the tone unit's words
+    /// (opt-in): each 14-bit linear (R, G, B) is scaled by `g(b) / 512`
+    /// before the 3x3 matrix, where `b = (wR R + wG G + wB B) / 32` with the
+    /// weights of +0x004 and `g` the 40-point table at +0x008. Read, not
+    /// declared: the register format (X-T3 5.11 setter 0x1062974 from the
+    /// filler 0x1d74f38; table records at 0x14eec3c, 0x200 throughout when
+    /// the mode is 0; weights 6/14/12 in every film shot so far, twice the
+    /// X70 film stage's 3/7/6). The brightness axis is fixed in hardware (the
+    /// setter programs no width): 13 cubic segments 4, 4, 8, ..., 8192 wide,
+    /// one octave of `b` each, read from the firmware's records (a gain that
+    /// doubles comes back 3 points earlier; on this axis every record keeps
+    /// `b * g(b)` monotone and at most full scale, a uniform axis does not).
+    /// Declared, not proven: Q9 on 14 bits, whether `b` is taken above the
+    /// black level, the place before the matrix, the mode at +0x000
+    /// (ignored). A table of zeros (unit not programmed) is left out.
+    pub fn with_brightness_gain(mut self, tone: &BTreeMap<u64, u32>) -> Self {
+        let t = |o: u64| tone.get(&o).copied().unwrap_or(0);
+        let points: [i64; 40] = std::array::from_fn(|i| {
+            i64::from((t(TONE_GAIN + 4 * (i / 2) as u64) >> (16 * (i % 2))) & 16383)
+        });
+        if points.iter().all(|&p| p == 0) {
+            self.brightness = None;
+            return self;
+        }
+        let weights = [0, 8, 16].map(|shift| ((t(TONE_WEIGHTS) >> shift) & 63) as i32);
+        let gain = (0..16384)
+            .map(|b| cubic(&points, &GAIN_WIDTHS, b).clamp(0, 16383) as u16)
+            .collect();
+        self.brightness = Some((gain, weights));
+        self
+    }
+    /// The same law with the luma bands of the YCbCr unit's words (opt-in):
+    /// after the 2x2 chroma matrix, centred (Cb, Cr) are scaled by
+    /// `f / 256`, `f = gain + slope * Y / 256` of the band `k` = number of
+    /// bounds (+0x258 bytes) at or below Y (0..255). Read, not declared: the
+    /// register format (X-T3 5.11 setter 0x1062e9c from the filler
+    /// 0x1d760f8; off: bounds 0, slopes 0, gains 0x100) and the law, which is
+    /// continuous at every bound of the five films shot so far and is the
+    /// X70 film stage's luma band law at Q8. Declared, not proven: the place
+    /// after the chroma matrix, the rounding. Five zero gains (unit not
+    /// programmed) are left out.
+    pub fn with_luma_bands(mut self, ycbcr: &BTreeMap<u64, u32>) -> Self {
+        let c = |o: u64| ycbcr.get(&o).copied().unwrap_or(0);
+        let bands: [(i32, i32); 5] = std::array::from_fn(|i| {
+            let w = c(LUMA_BANDS + 4 * i as u64);
+            (((w << 21) as i32) >> 21, ((w >> 16) & 1023) as i32)
+        });
+        if bands.iter().all(|&(_, gain)| gain == 0) {
+            self.luma_bands = None;
+            return self;
+        }
+        let knots = std::array::from_fn(|i| ((c(LUMA_KNOTS) >> (8 * i)) & 255) as i32);
+        self.luma_bands = Some((knots, bands));
+        self
+    }
+    /// The same law with the white balance of the tone unit's words
+    /// (opt-in): each 14-bit linear (R, G, B) is first scaled by the Q12
+    /// factor that moves the programmed gain's ratio to green from the
+    /// declared `reference` gains to the programmed ones, as the X70 film
+    /// stage's relative white balance ([`white_balance`]). Read, not
+    /// declared: the gains (+0x088 low R, high G, +0x08c low B; X-T3 5.11
+    /// FUN_01d748d0 computes them from the camera's white-balance gains,
+    /// 573 / 302 / 583 to 9149 / 4822 / 9309 in an auto white-balance shot,
+    /// one common scale, and the filler 0x1d74f38 programs them). Declared,
+    /// not proven: the place before the brightness gain and the matrix, and
+    /// the relative law itself (the declared scene renders neutral at the
+    /// `reference` gains, so a shot at those gains develops exactly as
+    /// without this stage). Gains not all programmed are left out; a zero
+    /// reference gain is an error.
+    pub fn with_white_balance(mut self, tone: &BTreeMap<u64, u32>, reference: [u32; 3]) -> Result<Self, String> {
+        if reference.contains(&0) {
+            return Err("a declared reference white-balance gain is zero".into());
+        }
+        let gains = TONE_GAINS.map(|(o, shift)| tone.get(&o).copied().unwrap_or(0) >> shift & 0xffff);
+        self.white_balance = (!gains.contains(&0)).then(|| {
+            std::array::from_fn(|c| {
+                let factor = (u64::from(gains[c]) * u64::from(reference[1]) << 12)
+                    / (u64::from(gains[1]) * u64::from(reference[c]));
+                factor.min(u64::from(u32::MAX)) as u32
+            })
+        });
+        Ok(self)
+    }
+    /// The same law with the 3D lookup table of the LUT unit's words (X-T3
+    /// 5.11 0xfff98000 / 0xfff90000, opt-in): `control` +0x00 bit 0 enables
+    /// it; `table` holds [`LUT_BYTES`] from offset 0, node `(r, g, b)` at
+    /// `8 * (16 * (16 * b + g) + r)` as u16 R, G (word 0) and B (word 1),
+    /// 12 bits each. Read, not declared: the table the firmware builds
+    /// (0x1d7a424: luminance plus a Sepia tint for Sepia, luminance alone for
+    /// the monochrome modes, the identity grid otherwise) and sends there
+    /// (0x1067cdc); the node order and the 273-level spacing (the Sepia
+    /// table an X-T3 5.11 shot writes: node 1 is the red step, node 256 the
+    /// blue one, node 0xfff white). Declared, not proven: the table sits
+    /// between the tone curves (taken to 12 bits) and the YCbCr matrix,
+    /// joined trilinearly.
+    pub fn with_lut3d(mut self, control: &BTreeMap<u64, u32>, table: &BTreeMap<u64, u32>) -> Self {
+        if control.get(&0).copied().unwrap_or(0) & 1 == 0 {
+            self.lut = None;
+            return self;
+        }
+        let w = |o: u64| table.get(&o).copied().unwrap_or(0);
+        self.lut = Some(
+            (0..LUT_BYTES / 8)
+                .map(|i| {
+                    let (a, b) = (w(8 * i), w(8 * i + 4));
+                    [a & 0xfff, a >> 16 & 0xfff, b & 0xfff].map(|v| v as u16)
+                })
+                .collect(),
+        );
+        self
+    }
+    /// Trilinear lookup of 12-bit (R, G, B) in the table.
+    fn lookup(lut: &[[u16; 3]], rgb: [i64; 3]) -> [i64; 3] {
+        let last = LUT_NODES as i64 - 1;
+        let at = rgb.map(|v| {
+            let v = v.clamp(0, 4095);
+            let k = (v / LUT_STEP).min(last - 1);
+            (k as usize, v - k * LUT_STEP)
+        });
+        let mut sum = [0i64; 3];
+        for corner in 0..8 {
+            let mut weight = 1;
+            let mut index = 0;
+            // Blue is the slowest axis, red the fastest.
+            for (axis, &(k, f)) in at.iter().enumerate().rev() {
+                let high = corner >> axis & 1 == 1;
+                weight *= if high { f } else { LUT_STEP - f };
+                index = index * LUT_NODES + k + usize::from(high);
+            }
+            for (s, v) in sum.iter_mut().zip(lut[index]) {
+                *s += weight * i64::from(v);
+            }
+        }
+        let whole = LUT_STEP * LUT_STEP * LUT_STEP;
+        sum.map(|s| (s + whole / 2) / whole)
+    }
+    /// Y, Cb, Cr of a 14-bit linear (R, G, B) level.
+    pub fn pixel(&self, linear: [u16; 3]) -> [i32; 3] {
+        let mut l = linear.map(|v| i32::from(v.min(16383)));
+        if let Some(f) = self.white_balance {
+            l = std::array::from_fn(|c| i32::from(balanced(l[c] as u16, f[c])));
+        }
+        if let Some((gain, w)) = &self.brightness {
+            let b = ((w[0] * l[0] + w[1] * l[1] + w[2] * l[2]) >> 5).clamp(0, 16383);
+            let g = i32::from(gain[b as usize]);
+            l = l.map(|v| ((v * g + 256) >> 9).min(16383));
+        }
+        let toned: [i32; 3] = std::array::from_fn(|c| {
+            let m = self.matrix[c];
+            (m[0] * l[0] + m[1] * l[1] + m[2] * l[2] + 512) >> 10
+        });
+        let rgb: [i32; 3] = match &self.lut {
+            None => std::array::from_fn(|c| {
+                i32::from(self.curves[c][toned[c].clamp(0, 16383) as usize])
+            }),
+            Some(lut) => {
+                let levels = std::array::from_fn(|c| {
+                    i64::from(self.levels[c][toned[c].clamp(0, 16383) as usize])
+                });
+                Self::lookup(lut, levels).map(|v| (v >> 4) as i32)
+            }
+        };
+        let mut v: [i32; 3] = std::array::from_fn(|row| {
+            let m = self.ycbcr[row];
+            (m[0] * rgb[0] + m[1] * rgb[1] + m[2] * rgb[2] + 512) >> 10
+        });
+        if let Some(k) = self.chroma_matrix {
+            let (cb, cr) = (v[1], v[2]);
+            v[1] = (k[0][0] * cb + k[0][1] * cr + 512) >> 10;
+            v[2] = (k[1][0] * cb + k[1][1] * cr + 512) >> 10;
+        }
+        if let Some((knots, bands)) = &self.luma_bands {
+            let y = v[0].clamp(0, 255);
+            let (slope, gain) = bands[knots.iter().filter(|&&k| k <= y).count()];
+            let f = gain + ((slope * y) >> 8);
+            v[1] = (v[1] * f + 128) >> 8;
+            v[2] = (v[2] * f + 128) >> 8;
+        }
+        std::array::from_fn(|row| match row {
+            0 => v[0],
+            _ => self.chroma[row - 1].unwrap_or(v[row] + 128),
+        })
+    }
+}
+
 /// Packed 4:2:2 lines (Y0 Y1 Cb Cr, `2 * width` bytes rounded up to a pair)
 /// developed from `lines` lines of little-endian u16 X-Trans samples, `stride`
 /// bytes apart, whose first sample is the tile site `phase` (line, sample),
@@ -247,6 +617,31 @@ pub fn develop(
     width: usize,
     phase: (usize, usize),
     film: Option<(&Film, [u32; 3])>,
+) -> Result<Vec<Vec<u8>>, String> {
+    develop_with(raw, stride, lines, width, phase, film, None)
+}
+
+/// [`develop`] with the X-T3 firmware color law (see [`FirmwareColor`]) in
+/// place of the declared sRGB; geometry, sampling and packing are the same.
+pub fn develop_firmware(
+    raw: &[u8],
+    stride: usize,
+    lines: usize,
+    width: usize,
+    phase: (usize, usize),
+    color: &FirmwareColor,
+) -> Result<Vec<Vec<u8>>, String> {
+    develop_with(raw, stride, lines, width, phase, None, Some(color))
+}
+
+fn develop_with(
+    raw: &[u8],
+    stride: usize,
+    lines: usize,
+    width: usize,
+    phase: (usize, usize),
+    film: Option<(&Film, [u32; 3])>,
+    firmware: Option<&FirmwareColor>,
 ) -> Result<Vec<Vec<u8>>, String> {
     if lines < 6 || width < 6 || stride < 2 * width || raw.len() < stride * (lines - 1) + 2 * width
     {
@@ -294,11 +689,14 @@ pub fn develop(
                     let x = (2 * pair + i).min(width - 1);
                     let site = &row[(x + phase.1) % 6];
                     let rgb = [0, 1, 2].map(|c| sample(y as i64 + site[c].0, x as i64 + site[c].1));
-                    *pixel = match pixels.as_mut() {
-                        Some(pixels) => pixels
+                    *pixel = match (pixels.as_mut(), firmware) {
+                        (Some(pixels), _) => pixels
                             .develop([level(0, rgb[0]), level(1, rgb[1]), level(2, rgb[2])])
                             .map(i32::from),
-                        None => ycbcr(rgb.map(|s| response[usize::from(s)])),
+                        (None, Some(color)) => {
+                            color.pixel([level(0, rgb[0]), level(1, rgb[1]), level(2, rgb[2])])
+                        }
+                        (None, None) => ycbcr(rgb.map(|s| response[usize::from(s)])),
                     };
                 }
                 if pixels.is_some() {
@@ -396,6 +794,99 @@ pub fn resample(source: &[u8], s: Scale) -> Result<Vec<Vec<u8>>, String> {
         .collect())
 }
 
+/// Bit positions of Y0, Y1, Y2, Y3, Cb and Cr in a Y0L2 block (10 bits each;
+/// Linux drm_fourcc.h DRM_FORMAT_Y0L2: Y0 9..0, Cb 19..10, Y1 29..20, A0 30,
+/// A1 31, Y2 41..32, Cr 51..42, Y3 61..52, A2 62, A3 63).
+pub const Y0L2: [u32; 6] = [0, 20, 32, 52, 10, 42];
+
+/// Y, Cb and Cr of pixel `x` of the upper (`line` 0) or lower line of a Y0L2 row.
+pub fn y0l2_sample(row: &[u8], x: usize, line: usize) -> (u16, u16, u16) {
+    let at = x / 2 * 8;
+    let block = u64::from_le_bytes(row[at..at + 8].try_into().expect("8 bytes"));
+    let field = |bit: u32| ((block >> bit) & 0x3ff) as u16;
+    (field(Y0L2[line * 2 + x % 2]), field(Y0L2[4]), field(Y0L2[5]))
+}
+
+/// A Y0L2 block from its four luma samples (upper line, then lower) and its
+/// chroma; alpha bits 0.
+pub fn y0l2_block(luma: [u16; 4], cb: u16, cr: u16) -> u64 {
+    let mut block = 0;
+    for (value, bit) in luma.into_iter().chain([cb, cr]).zip(Y0L2) {
+        block |= u64::from(value & 0x3ff) << bit;
+    }
+    block
+}
+
+/// How a declared RAW to YC step lays out its picture in pitch rows.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub enum YcLayout {
+    /// One packed 4:2:2 8-bit line (Y0 Y1 Cb Cr per pixel pair) per row.
+    Lines,
+    /// Two packed 4:2:2 8-bit lines per row, the second 2 x width bytes
+    /// after the first.
+    Paired,
+    /// Two lines per row as Y0L2 blocks of 10-bit samples.
+    Y0l2,
+}
+
+impl YcLayout {
+    /// Picture lines per pitch row.
+    pub fn lines(self) -> u64 {
+        if self == Self::Lines { 1 } else { 2 }
+    }
+}
+
+/// 10-bit Y, Cb, Cr of the `width` pixels of a picture line taken by nearest
+/// neighbour from a RAW line of `window` 16-bit little-endian samples: pixel
+/// x reads sample x * window / width; luma (sample << 2) >> `shift` (at most
+/// 1023), chroma neutral (512). A declared grey stand-in for development.
+pub fn grey_line(raw: &[u8], window: u64, width: u64, shift: u32) -> Vec<[u16; 3]> {
+    (0..width)
+        .map(|x| {
+            let i = (x * window / width) as usize * 2;
+            let v = u32::from(u16::from_le_bytes([raw[i], raw[i + 1]]));
+            [((v << 2) >> shift).min(1023) as u16, 512, 512]
+        })
+        .collect()
+}
+
+/// [`grey_line`] from a developed packed 4:2:2 8-bit line of `window` pixels
+/// (as [`develop`] writes them) instead, samples widened by << 2.
+pub fn developed_line(line: &[u8], window: u64, width: u64) -> Vec<[u16; 3]> {
+    (0..width)
+        .map(|x| {
+            let s = (x * window / width) as usize;
+            let p = s / 2 * 4;
+            [line[p + s % 2], line[p + 2], line[p + 3]].map(|b| u16::from(b) << 2)
+        })
+        .collect()
+}
+
+/// One pitch row of `layout` from its upper picture line and, for the
+/// layouts that pair lines, its lower one (10-bit samples; 8-bit layouts
+/// narrow by >> 2; a pixel pair or a Y0L2 block takes the chroma of its
+/// upper left pixel).
+pub fn yc_row(layout: YcLayout, upper: &[[u16; 3]], lower: &[[u16; 3]]) -> Vec<u8> {
+    let packed = |line: &[[u16; 3]]| -> Vec<u8> {
+        line.chunks_exact(2)
+            .flat_map(|p| [p[0][0], p[1][0], p[0][1], p[0][2]].map(|v| (v >> 2) as u8))
+            .collect()
+    };
+    match layout {
+        YcLayout::Lines => packed(upper),
+        YcLayout::Paired => {
+            let mut row = packed(upper);
+            row.extend(packed(lower));
+            row
+        }
+        YcLayout::Y0l2 => upper
+            .chunks_exact(2)
+            .zip(lower.chunks_exact(2))
+            .flat_map(|(u, d)| y0l2_block([u[0][0], u[1][0], d[0][0], d[1][0]], u[0][1], u[0][2]).to_le_bytes())
+            .collect(),
+    }
+}
+
 #[cfg(test)]
 pub(crate) mod tests {
     use super::*;
@@ -436,6 +927,367 @@ pub(crate) mod tests {
             }
         }
         assert!(develop(&raw, stride, lines, width + 8, (2, 2), None).is_err());
+    }
+
+    /// Tone and YCbCr unit words an X-T3 5.11 still programs (M5 shot).
+    pub(crate) fn firmware_units() -> (BTreeMap<u64, u32>, BTreeMap<u64, u32>) {
+        let curve = [
+            0x0443_0000, 0x058d_048c, 0x0780_0699, 0x0a7c_0878, 0x0e76_0c99, 0x155e_1244,
+            0x1da3_1811, 0x2540_21db, 0x2b64_28aa, 0x3009_2dad, 0x336d_31c3, 0x38dc_369b,
+            0x3bdb_3add, 0x3da6_3cca, 0x3f4b_3e82, 0x0000_3fff,
+        ];
+        let mut tone: BTreeMap<u64, u32> = [
+            (0x200, 0x0101_0100),
+            (0x204, 0x1fb8_041b),
+            (0x208, 0x0000_002d),
+            (0x20c, 0x0470_1fc5),
+            (0x210, 0x0000_1fcb),
+            (0x214, 0x1f36_0049),
+            (0x218, 0x0000_0481),
+            (0x21c, 0x7666_5433),
+            (0x220, 0x0000_0066),
+        ]
+        .into();
+        for slot in [0x224, 0x264, 0x2a4] {
+            for (i, w) in curve.iter().enumerate() {
+                tone.insert(slot + 4 * i as u64, *w);
+            }
+        }
+        let ycbcr = [
+            (0x200, 0x3000_1515),
+            (0x204, 0x0259_0132),
+            (0x208, 0x1f53_0075),
+            (0x20c, 0x0200_1ead),
+            (0x210, 0x1e53_0200),
+            (0x214, 0x0000_1fad),
+        ]
+        .into();
+        (tone, ycbcr)
+    }
+
+    #[test]
+    fn the_firmware_color_units_decode_as_the_shot_programs_them() {
+        let (tone, ycbcr) = firmware_units();
+        let color = FirmwareColor::from_words(&tone, &ycbcr).unwrap();
+        assert_eq!(color.matrix, [[1051, -72, 45], [-59, 1136, -53], [73, -202, 1153]]);
+        assert_eq!(color.ycbcr, [[306, 601, 117], [-173, -339, 512], [512, -429, -83]]);
+        for curve in &color.curves {
+            assert_eq!(curve.len(), 16384);
+            assert!(curve.windows(2).all(|w| w[0] <= w[1]));
+            // Three segments 2^n wide per nibble 3 3 4 5 6 6 6 7 6 6 sum to
+            // 1536: input 256 (x 24) is point 3 (1421), input 8192 (x 768)
+            // point 21 (13165), as 14-bit levels' top bytes.
+            assert_eq!((curve[0], curve[256], curve[8192], curve[16383]), (0, 22, 205, 255));
+        }
+        // Between knots the points are joined linearly: input 128 (x 12) is
+        // halfway from point 1 to point 2.
+        let point = |i: u64| i64::from((tone[&(0x224 + 4 * (i / 2))] >> (16 * (i % 2))) & 16383);
+        assert_eq!(i64::from(color.curves[0][128]), (point(1) + point(2) + 1) / 2 >> 6);
+        // Rows of the matrix sum to 1024, so grey stays grey.
+        assert_eq!(color.pixel([16383; 3]), [255, 128, 128]);
+        assert_eq!(color.pixel([0; 3]), [0, 128, 128]);
+        let grey = color.pixel([4096; 3]);
+        assert_eq!(grey[1..], [128, 128]);
+        // A red level reads red: Cr above, Cb below the neutral 128.
+        let red = color.pixel([8192, 2048, 2048]);
+        assert!(red[2] > 140 && red[1] < 128, "{red:?}");
+        // Words are read, not built in: a halved red curve darkens red.
+        let mut half = tone.clone();
+        for i in 0..16u64 {
+            let w = half[&(0x224 + 4 * i)];
+            half.insert(0x224 + 4 * i, (w >> 1) & 0x7fff_7fff);
+        }
+        let darker = FirmwareColor::from_words(&half, &ycbcr).unwrap().pixel([8192, 2048, 2048]);
+        assert!(darker[2] < red[2], "{darker:?} {red:?}");
+        assert!(FirmwareColor::from_words(&BTreeMap::new(), &ycbcr).is_err());
+        assert!(FirmwareColor::from_words(&tone, &BTreeMap::new()).is_err());
+    }
+
+    #[test]
+    fn the_chroma_modes_hold_cb_and_cr_only_when_the_control_word_sets_them() {
+        let (tone, mut ycbcr) = firmware_units();
+        let plain = FirmwareColor::from_words(&tone, &ycbcr).unwrap();
+        let red = plain.pixel([8192, 2048, 2048]);
+        // PROVIA's control word (both modes 0) changes nothing.
+        assert_eq!(plain.clone().with_chroma_modes(&ycbcr), plain);
+        // ACROS's control word (modes 1 and 1): Y as before, Cb = Cr = 128.
+        ycbcr.insert(0x200, 0x3011_1115);
+        let mono = FirmwareColor::from_words(&tone, &ycbcr).unwrap().with_chroma_modes(&ycbcr);
+        assert_eq!(mono.pixel([8192, 2048, 2048]), [red[0], 128, 128]);
+        // Each field holds only its own component.
+        ycbcr.insert(0x200, 0x3001_1115);
+        let cb = FirmwareColor::from_words(&tone, &ycbcr).unwrap().with_chroma_modes(&ycbcr);
+        assert_eq!(cb.pixel([8192, 2048, 2048]), [red[0], 128, red[2]]);
+        // Another mode value is not read as constant.
+        ycbcr.insert(0x200, 0x3022_1115);
+        let other = FirmwareColor::from_words(&tone, &ycbcr).unwrap().with_chroma_modes(&ycbcr);
+        assert_eq!(other.pixel([8192, 2048, 2048]), red);
+    }
+
+    #[test]
+    fn the_chroma_matrix_keeps_the_identity_greys_a_zero_one_and_scales_a_gain() {
+        let (tone, mut ycbcr) = firmware_units();
+        let plain = FirmwareColor::from_words(&tone, &ycbcr).unwrap();
+        let red = plain.pixel([8192, 2048, 2048]);
+        // Identity (the firmware's default 1024/0/1024/0) changes no pixel.
+        ycbcr.insert(0x238, 1024);
+        ycbcr.insert(0x23c, 1024);
+        assert_eq!(plain.clone().with_chroma_matrix(&ycbcr).pixel([8192, 2048, 2048]), red);
+        // Zero (the monochrome films): Y as before, Cb = Cr = 128.
+        ycbcr.insert(0x238, 0);
+        ycbcr.insert(0x23c, 0);
+        assert_eq!(plain.clone().with_chroma_matrix(&ycbcr).pixel([8192, 2048, 2048]), [red[0], 128, 128]);
+        // Half gain on both diagonals, a negative cross term on Cr.
+        ycbcr.insert(0x238, 512);
+        ycbcr.insert(0x23c, 512 | ((-256i32 as u32) & 0x1fff) << 16);
+        let p = plain.clone().with_chroma_matrix(&ycbcr).pixel([8192, 2048, 2048]);
+        let (cb, cr) = (red[1] - 128, red[2] - 128);
+        assert_eq!(p, [red[0], ((512 * cb + 512) >> 10) + 128, ((-256 * cb + 512 * cr + 512) >> 10) + 128]);
+    }
+
+    /// Tone unit words with the brightness weights 6/14/12 and the gain
+    /// table `point(i)`, i = 0..40.
+    fn with_gain_table(mut tone: BTreeMap<u64, u32>, point: impl Fn(u32) -> u32) -> BTreeMap<u64, u32> {
+        tone.insert(0x004, 6 | 14 << 8 | 12 << 16);
+        for i in 0..20u32 {
+            tone.insert(0x008 + 4 * u64::from(i), point(2 * i) | point(2 * i + 1) << 16);
+        }
+        tone
+    }
+
+    #[test]
+    fn the_brightness_gain_keeps_a_neutral_table_scales_a_flat_one_and_passes_its_bounds() {
+        let (tone, ycbcr) = firmware_units();
+        let plain = FirmwareColor::from_words(&tone, &ycbcr).unwrap();
+        let inputs = [[8192, 2048, 2048], [0, 0, 0], [16383, 16383, 16383], [123, 4567, 89], [3000, 3000, 3000]];
+        // 0x200 throughout (the firmware's mode 0) changes no pixel.
+        let neutral = plain.clone().with_brightness_gain(&with_gain_table(tone.clone(), |_| 0x200));
+        assert!(neutral.brightness.is_some());
+        for x in inputs {
+            assert_eq!(neutral.pixel(x), plain.pixel(x));
+        }
+        // A table of zeros (unit not programmed) is left out.
+        assert_eq!(plain.clone().with_brightness_gain(&with_gain_table(tone.clone(), |_| 0)), plain);
+        // 0x400 throughout doubles every level, clamped to 14 bits.
+        let double = plain.clone().with_brightness_gain(&with_gain_table(tone.clone(), |_| 0x400));
+        for x in inputs {
+            assert_eq!(double.pixel(x), plain.pixel(x.map(|v| (2 * v).min(16383))));
+        }
+        // The gain passes through the end point of each segment, at the
+        // brightness where the segment starts: points 0, 3, 6, ..., 36.
+        let ramp = plain.clone().with_brightness_gain(&with_gain_table(tone.clone(), |i| 0x200 + 7 * i));
+        let (gain, weights) = ramp.brightness.as_ref().unwrap();
+        assert_eq!(*weights, [6, 14, 12]);
+        let mut start = 0;
+        for (k, width) in GAIN_WIDTHS.iter().enumerate() {
+            assert_eq!(u32::from(gain[start as usize]), 0x200 + 7 * 3 * k as u32);
+            start += width;
+        }
+        assert_eq!(start, 16384);
+        // A grey of 3000: b = (6 + 14 + 12) * 3000 / 32 = 3000, scaled by g(3000) / 512.
+        let g = i32::from(gain[3000]);
+        let scaled = ((3000 * g + 256) >> 9).min(16383) as u16;
+        assert_eq!(ramp.pixel([3000; 3]), plain.pixel([scaled; 3]));
+    }
+
+    #[test]
+    fn the_brightness_axis_is_one_octave_per_segment() {
+        // Segment bounds 0, 4, 8, 16, ..., 8192, 16384: fixed, doubling.
+        let bounds: Vec<i64> = std::iter::once(0)
+            .chain(GAIN_WIDTHS.iter().scan(0, |s, w| {
+                *s += w;
+                Some(*s)
+            }))
+            .collect();
+        assert_eq!(bounds[..3], [0, 4, 8]);
+        assert!(bounds[2..].windows(2).all(|w| w[1] == 2 * w[0]));
+        assert_eq!(*bounds.last().unwrap(), 16384);
+        // A gain that doubles every 3 points back from the end (0x200 at the
+        // end, capped to 14 bits) keeps b * g(b) at full scale on every bound
+        // it reaches uncapped: one segment is one octave of b.
+        let (tone, ycbcr) = firmware_units();
+        let table = |i: u32| (512.0 * 2f64.powf((39.0 - f64::from(i)) / 3.0)).round().min(16383.0) as u32;
+        let geometric = FirmwareColor::from_words(&tone, &ycbcr)
+            .unwrap()
+            .with_brightness_gain(&with_gain_table(tone.clone(), table));
+        let (gain, _) = geometric.brightness.as_ref().unwrap();
+        for (k, &b) in bounds[..13].iter().enumerate().skip(1) {
+            let g = i64::from(gain[b as usize]);
+            assert_eq!(g, i64::from(table(3 * k as u32)));
+            if g < 16383 {
+                assert_eq!((b * g + 256) >> 9, 16384, "bound {b}");
+            }
+        }
+    }
+
+    #[test]
+    fn the_white_balance_is_off_by_default_exact_at_its_reference_and_relative_otherwise() {
+        let (tone, ycbcr) = firmware_units();
+        let plain = FirmwareColor::from_words(&tone, &ycbcr).unwrap();
+        assert_eq!(plain.white_balance, None);
+        let samples = [[0, 0, 0], [16383; 3], [4096; 3], [8192, 2048, 2048], [123, 4567, 8910]];
+        // The auto white-balance shot's gains (R, G, B) = 9149, 4822, 9309.
+        let mut shot = tone.clone();
+        shot.insert(0x088, 4822 << 16 | 9149);
+        shot.insert(0x08c, 9309);
+        let reference = [9149, 4822, 9309];
+        let same = plain.clone().with_white_balance(&shot, reference).unwrap();
+        assert_eq!(same.white_balance, Some([4096; 3]));
+        for s in samples {
+            assert_eq!(same.pixel(s), plain.pixel(s));
+        }
+        // Gains not programmed: the stage is left out.
+        assert_eq!(plain.clone().with_white_balance(&tone, reference).unwrap(), plain);
+        let mut half = shot.clone();
+        half.insert(0x08c, 0);
+        assert_eq!(plain.clone().with_white_balance(&half, reference).unwrap(), plain);
+        assert!(plain.clone().with_white_balance(&shot, [9149, 0, 9309]).is_err());
+        // Red gain doubled at the same green, blue gain halved: relative
+        // factors 2 and 1/2 on the linear levels, before the matrix.
+        let mut warm = shot.clone();
+        warm.insert(0x088, 4822 << 16 | 2 * 9149);
+        warm.insert(0x08c, 9309 / 2 + 1);
+        let tinted = plain.clone().with_white_balance(&warm, reference).unwrap();
+        let f = tinted.white_balance.unwrap();
+        // 9309 / 2 + 1 = 4655: 4655 x 4096 / 9309 = 2048 (rounded down).
+        assert_eq!(f, [8192, 4096, 2048]);
+        assert_eq!(tinted.pixel([2048, 4096, 8192]), plain.pixel([4096; 3]));
+        assert_ne!(tinted.pixel([4096; 3]), plain.pixel([4096; 3]));
+        // A common scale of all three gains changes nothing.
+        let mut scaled = shot.clone();
+        scaled.insert(0x088, 2 * 4822 << 16 | 2 * 9149);
+        scaled.insert(0x08c, 2 * 9309);
+        assert_eq!(plain.clone().with_white_balance(&scaled, reference).unwrap().white_balance, Some([4096; 3]));
+        // Levels clip at full scale: a doubled red saturates like full red.
+        assert_eq!(tinted.pixel([16383, 0, 0]), tinted.pixel([8192, 0, 0]));
+    }
+
+    #[test]
+    fn the_luma_bands_keep_the_off_state_and_follow_the_provia_law() {
+        let (tone, mut ycbcr) = firmware_units();
+        let plain = FirmwareColor::from_words(&tone, &ycbcr).unwrap();
+        let inputs = [[8192, 2048, 2048], [2048, 2048, 8192], [500, 900, 300], [16383, 9000, 12000]];
+        let band = |slope: i32, gain: u32| (slope as u32 & 0x7ff) | gain << 16;
+        // Off (the firmware's default: bounds 0, slopes 0, gains 0x100)
+        // changes no pixel.
+        ycbcr.insert(0x258, 0);
+        for i in 0..5 {
+            ycbcr.insert(0x25c + 4 * i, band(0, 0x100));
+        }
+        let off = plain.clone().with_luma_bands(&ycbcr);
+        assert!(off.luma_bands.is_some());
+        for x in inputs {
+            assert_eq!(off.pixel(x), plain.pixel(x));
+        }
+        // Five zero gains (unit not programmed) are left out.
+        for i in 0..5 {
+            ycbcr.insert(0x25c + 4 * i, 0);
+        }
+        assert_eq!(plain.clone().with_luma_bands(&ycbcr), plain);
+        // PROVIA, as X-T3 5.11 programs it.
+        ycbcr.insert(0x258, 64 | 128 << 8 | 192 << 16 | 230 << 24);
+        for (i, (slope, gain)) in [(128, 208), (64, 224), (0, 256), (-64, 304), (-256, 476)].into_iter().enumerate() {
+            ycbcr.insert(0x25c + 4 * i as u64, band(slope, gain));
+        }
+        let provia = plain.clone().with_luma_bands(&ycbcr);
+        let (knots, bands) = provia.luma_bands.unwrap();
+        assert_eq!(knots, [64, 128, 192, 230]);
+        let f = |y: i32| {
+            let (slope, gain) = bands[knots.iter().filter(|&&k| k <= y).count()];
+            gain + ((slope * y) >> 8)
+        };
+        assert_eq!([f(0), f(64), f(128), f(192), f(229), f(230), f(255)], [208, 240, 256, 256, 246, 246, 221]);
+        // Continuous at every bound, to one step.
+        for &k in &knots {
+            assert!((f(k) - f(k - 1)).abs() <= 1, "bound {k}");
+        }
+        for x in inputs {
+            let p = plain.pixel(x);
+            let (cb, cr) = (p[1] - 128, p[2] - 128);
+            let k = f(p[0].clamp(0, 255));
+            assert_eq!(provia.pixel(x), [p[0], ((cb * k + 128) >> 8) + 128, ((cr * k + 128) >> 8) + 128]);
+        }
+    }
+
+    /// LUT unit words: enabled control and the table of `node(r, g, b)`.
+    pub(crate) fn lut_words(node: impl Fn(u32, u32, u32) -> [u32; 3]) -> (BTreeMap<u64, u32>, BTreeMap<u64, u32>) {
+        let mut table = BTreeMap::new();
+        for i in 0..16 * 16 * 16u32 {
+            let [r, g, b] = node(i & 15, i >> 4 & 15, i >> 8);
+            table.insert(8 * u64::from(i), r | g << 16);
+            table.insert(8 * u64::from(i) + 4, b);
+        }
+        ([(0, 1)].into(), table)
+    }
+
+    #[test]
+    fn the_lut3d_identity_grid_changes_no_pixel_and_a_disabled_unit_is_ignored() {
+        let (tone, ycbcr) = firmware_units();
+        let plain = FirmwareColor::from_words(&tone, &ycbcr).unwrap();
+        let (control, table) = lut_words(|r, g, b| [r, g, b].map(|v| v * 273));
+        let lut = plain.clone().with_lut3d(&control, &table);
+        assert!(lut.lut.is_some());
+        for l in [[0; 3], [16383; 3], [4096; 3], [8192, 2048, 2048], [123, 4567, 15000], [1, 2, 3]] {
+            assert_eq!(lut.pixel(l), plain.pixel(l), "{l:?}");
+        }
+        for v in (0..16384u16).step_by(97) {
+            assert_eq!(lut.pixel([v, 16383 - v, v / 2]), plain.pixel([v, 16383 - v, v / 2]));
+        }
+        // Control bit 0 clear: no table, the law is the plain one.
+        let off = plain.clone().with_lut3d(&[(0, 0x100)].into(), &table);
+        assert_eq!(off, plain);
+    }
+
+    #[test]
+    fn a_luminance_lut3d_develops_grey_and_a_tinted_one_develops_sepia() {
+        let (tone, ycbcr) = firmware_units();
+        let plain = FirmwareColor::from_words(&tone, &ycbcr).unwrap();
+        // The firmware's monochrome table: Y = (306 r + 601 g + 117 b) / 1024
+        // on all three outputs.
+        let y = |r: u32, g: u32, b: u32| (306 * r + 601 * g + 117 * b) * 273 / 1024;
+        let (control, mono) = lut_words(|r, g, b| [y(r, g, b); 3]);
+        let grey = plain.clone().with_lut3d(&control, &mono);
+        for l in [[8192, 2048, 2048], [1000, 9000, 3000], [16383, 0, 0]] {
+            let p = grey.pixel(l);
+            assert!((p[1] - 128).abs() <= 1 && (p[2] - 128).abs() <= 1, "{l:?} {p:?}");
+        }
+        // A warm tint (red up, blue down, as the Sepia table's Cr 204 /
+        // Cb -208 on mid levels): Cr above, Cb below the neutral 128.
+        let warm = |r: u32, g: u32, b: u32| {
+            let v = y(r, g, b) as i32;
+            [v + 200, v, v - 200].map(|c| c.clamp(0, 4095) as u32)
+        };
+        let (control, sepia) = lut_words(warm);
+        let p = plain.clone().with_lut3d(&control, &sepia).pixel([4096; 3]);
+        assert!(p[2] > 133 && p[1] < 123, "{p:?}");
+    }
+
+    #[test]
+    fn a_uniform_grey_develops_neutral_through_the_firmware_color() {
+        let (tone, ycbcr) = firmware_units();
+        let color = FirmwareColor::from_words(&tone, &ycbcr).unwrap();
+        let (black, white) = (crate::imaging::BLACK, crate::imaging::WHITE);
+        let grey = black + (white - black) / 4;
+        let (lines, width, stride) = (12, 12, 32);
+        let mut raw = vec![0; stride * lines];
+        for y in 0..lines {
+            for x in 0..width {
+                raw[y * stride + 2 * x..][..2].copy_from_slice(&grey.to_le_bytes());
+            }
+        }
+        let out = develop_firmware(&raw, stride, lines, width, (2, 2), &color).unwrap();
+        assert_eq!((out.len(), out[0].len()), (12, 24));
+        let linear = ((u32::from(grey - black)) * 16383 / u32::from(white - black)) as u16;
+        let [y, ..] = color.pixel([linear; 3]);
+        for line in &out {
+            for p in line.chunks_exact(4) {
+                assert_eq!(p, [y as u8, y as u8, 128, 128]);
+            }
+        }
+        // The declared path of the same RAW is untouched by the option.
+        let declared = develop(&raw, stride, lines, width, (2, 2), None).unwrap();
+        assert_ne!(declared, out);
+        assert!(develop_firmware(&raw, stride, lines, width + 8, (2, 2), &color).is_err());
     }
 
     #[test]

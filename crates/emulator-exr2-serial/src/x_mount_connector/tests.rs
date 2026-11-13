@@ -64,6 +64,8 @@ fn setup() -> (XMountLens, gpio::Gpio, irq::InterruptController, TestHost) {
             focus_ring: 0xffff,
             detail_status: 0x14,
             read_catalogs: vec![],
+            family_replies: vec![],
+            focus_position: None,
         },
         100,
         options(),

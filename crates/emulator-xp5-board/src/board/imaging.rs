@@ -57,6 +57,7 @@ pub fn register_all(
             dma: Some([162, 163]),
             timing: [166, 164],
             latch_unrouted: false,
+            start_pulse: None,
         }),
         (0x59, 4),
     );

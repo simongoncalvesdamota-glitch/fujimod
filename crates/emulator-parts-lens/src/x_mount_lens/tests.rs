@@ -10,6 +10,8 @@ fn configuration() -> Configuration {
         focus_ring: 0xffff,
         detail_status: 0x14,
         read_catalogs: vec![],
+            family_replies: vec![],
+            focus_position: None,
     }
 }
 fn pins() -> Pins {

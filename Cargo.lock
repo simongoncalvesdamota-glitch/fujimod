@@ -2567,6 +2567,8 @@ name = "fujimod-emulator-xp4-storage"
 version = "0.1.0"
 dependencies = [
  "fujimod-emulator-devices",
+ "fujimod-emulator-parts-io",
+ "fujimod-emulator-parts-lens",
  "fujimod-workspace-hack",
  "serde",
  "serde_json",

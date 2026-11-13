@@ -140,6 +140,18 @@ struct DmaState {
     irq_routes: [u32; 16],
     request_mux: BTreeMap<u64, u32>,
     request_mux_changed: [u64; 16],
+    #[serde(default)]
+    peer: Option<PeerState>,
+    #[serde(default)]
+    microphone_frames: Option<u64>,
+}
+#[derive(Deserialize)]
+#[serde(deny_unknown_fields)]
+struct PeerState {
+    fifo: u64,
+    received: std::collections::VecDeque<u8>,
+    early: [bool; 16],
+    device: Value,
 }
 impl DmaController {
     pub(super) fn restore_state(&mut self, value: &Value) -> Result<(), String> {
@@ -156,6 +168,19 @@ impl DmaController {
         {
             return Err("Invalid XP4 DMA checkpoint or routes".into());
         }
+        match (&mut self.peer, state.peer) {
+            (None, None) => {}
+            (Some(peer), Some(saved)) if saved.fifo == peer.fifo => {
+                peer.device.restore(&saved.device)?;
+                peer.received = saved.received;
+                peer.early = saved.early;
+            }
+            _ => return Err("XP4 DMA peer checkpoint differs from its wiring".into()),
+        }
+        if state.microphone_frames.is_some() != self.microphone().is_some() {
+            return Err("XP4 DMA test microphone checkpoint differs from its definition".into());
+        }
+        self.microphone_frames = state.microphone_frames.unwrap_or(0);
         self.channels = state
             .channels
             .try_into()

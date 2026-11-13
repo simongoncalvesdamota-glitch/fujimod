@@ -8,6 +8,11 @@ pub trait Input: Send {
     fn exchange(&mut self, bits: u32, tx: u16, tick: u64) -> Result<u16, String>;
     fn save(&self) -> Value;
     fn restore(&mut self, value: &Value) -> Result<(), String>;
+    /// Changes an outside-driven word mid-run (a switch the user moves).
+    /// `Ok(false)`: this part has no such word.
+    fn set_input(&mut self, _register: u8, _value: u16) -> Result<bool, String> {
+        Ok(false)
+    }
 }
 pub struct FixedPin(pub bool);
 impl Input for FixedPin {
@@ -24,6 +29,42 @@ impl Input for FixedPin {
         Ok(())
     }
 }
+/// Several serial parts on one controller, each behind its own chip select
+/// (X-T3 5.11: power controller on GPIO 12.5 and battery gauge on GPIO 12.6,
+/// both on SPI 1). Every part sees every word and answers only while selected;
+/// unselected parts drive their idle level, so they must idle low and the bus
+/// returns the OR of their answers.
+pub struct SharedBus(pub Vec<Box<dyn Input>>);
+impl Input for SharedBus {
+    fn exchange(&mut self, bits: u32, tx: u16, tick: u64) -> Result<u16, String> {
+        let mut rx = 0;
+        for part in &mut self.0 {
+            rx |= part.exchange(bits, tx, tick)?;
+        }
+        Ok(rx)
+    }
+    fn save(&self) -> Value {
+        json!({"kind": "shared-bus", "parts": self.0.iter().map(|p| p.save()).collect::<Vec<_>>()})
+    }
+    fn restore(&mut self, value: &Value) -> Result<(), String> {
+        let parts = value["parts"]
+            .as_array()
+            .filter(|p| value["kind"] == "shared-bus" && p.len() == self.0.len())
+            .ok_or("XP4 SPI shared bus differs")?;
+        for (part, saved) in self.0.iter_mut().zip(parts) {
+            part.restore(saved)?;
+        }
+        Ok(())
+    }
+    fn set_input(&mut self, register: u8, value: u16) -> Result<bool, String> {
+        for part in &mut self.0 {
+            if part.set_input(register, value)? {
+                return Ok(true);
+            }
+        }
+        Ok(false)
+    }
+}
 pub struct Spi {
     base: u64,
     input: Box<dyn Input>,
@@ -35,8 +76,16 @@ pub struct Spi {
     rx: VecDeque<u16>,
     pending: Option<(u64, u64, u16, u32)>,
     generation: u64,
+    /// +0x24 DMA request enables: bit 0 transmit, bit 1 receive. The X-T3
+    /// lens driver (0x106E0B0) sets both on SPI0. Stored and read back; the
+    /// FIFO, shift timing and polling status are unchanged by it.
+    request: u32,
 }
 impl Spi {
+    /// See [`Input::set_input`].
+    pub fn set_input(&mut self, register: u8, value: u16) -> Result<bool, String> {
+        self.input.set_input(register, value)
+    }
     pub fn new(base: u64, input: Box<dyn Input>) -> Self {
         Self {
             base,
@@ -49,6 +98,7 @@ impl Spi {
             rx: VecDeque::new(),
             pending: None,
             generation: 0,
+            request: 0,
         }
     }
     fn start(&mut self, cx: &mut Cx<'_>) {
@@ -98,6 +148,7 @@ impl Spi {
                 }
                 0x10 => self.divider,
                 0x14 => self.causes,
+                0x24 => self.request,
                 _ => 0,
             } as u64);
         }
@@ -156,7 +207,21 @@ impl Spi {
                     self.rx.clear();
                 }
             }
-            0x24 if value != 0 => return Err("XP4 SPI request enable +0x24 is unsupported".into()),
+            0x24 => {
+                if value & !3 != 0 {
+                    return Err("Unknown XP4 SPI request enable bits".into());
+                }
+                if value != self.request {
+                    cx.record(Record::new(
+                        "XP4 SPI DMA request enable",
+                        [
+                            ("base", Field::int(self.base)),
+                            ("request", Field::int(value)),
+                        ],
+                    ));
+                }
+                self.request = value;
+            }
             _ => {}
         }
         Ok(0)
@@ -250,6 +315,55 @@ mod tests {
         assert_eq!(source.rx, [255, 255]);
     }
     #[test]
+    fn dma_request_enable_is_stored_and_leaves_the_fifo_path_unchanged() {
+        let run = |request: Option<u64>| {
+            let mut m = Spi::new(0xfff32000, Box::new(FixedPin(true)));
+            let mut h = Clock::default();
+            // Lens driver order: format (bits 6/7, 8-bit), enable, divider, +0x24, causes.
+            let mut writes = vec![(0, 0xc7), (4, 0xa), (0x10, 2)];
+            writes.extend(request.map(|r| (0x24, r)));
+            writes.extend([(0x14, 0xf), (8, 0x12), (8, 0x34)]);
+            for (o, v) in writes {
+                let mut cx = Cx::new(&mut h, 0, 0x106e0ec, 0);
+                m.write(&mut cx, 0xfff32000 + o, 4, v);
+                assert_eq!(cx.refusal(), None, "{o:#x} <- {v:#x}");
+            }
+            for (now, token) in [(16, 1), (32, 2)] {
+                h.now = now;
+                m.event(&mut Cx::new(&mut h, 0, 0, 0), token);
+            }
+            let request = m.read(&mut Cx::new(&mut h, 0, 0, 0), 0xfff32024, 4);
+            let words: Vec<u64> = (0..2)
+                .map(|_| m.read(&mut Cx::new(&mut h, 0, 0, 0), 0xfff32008, 4))
+                .collect();
+            (request, words, m.save(), h.records)
+        };
+        let (none, none_words, none_state, none_records) = run(None);
+        let (zero, zero_words, zero_state, zero_records) = run(Some(0));
+        let (dma, dma_words, dma_state, dma_records) = run(Some(3));
+        assert_eq!((none, zero, dma), (0, 0, 3));
+        assert_eq!(none_words, [255, 255]);
+        assert_eq!((&zero_words, &dma_words), (&none_words, &none_words));
+        // Writing 0 is invisible; 3 adds only the stored key and one record.
+        assert_eq!((&zero_state, &zero_records), (&none_state, &none_records));
+        assert!(none_state.get("request").is_none());
+        assert_eq!(dma_state["request"], 3);
+        assert_eq!(dma_records.len(), none_records.len() + 1);
+        assert_eq!(dma_records[0].name, "XP4 SPI DMA request enable");
+        let mut resumed = Spi::new(0xfff32000, Box::new(FixedPin(true)));
+        resumed.restore(&dma_state).unwrap();
+        assert_eq!(resumed.save(), dma_state);
+        resumed.restore(&none_state).unwrap();
+        assert_eq!(resumed.request, 0);
+        let mut bad = dma_state.clone();
+        bad["request"] = json!(4);
+        assert!(resumed.restore(&bad).is_err());
+        let mut h = Clock::default();
+        let mut cx = Cx::new(&mut h, 0, 0, 0);
+        resumed.write(&mut cx, 0xfff32024, 4, 4);
+        assert!(cx.refusal().is_some());
+    }
+    #[test]
     fn queued_words_keep_their_clock_edges_when_events_are_delivered_late() {
         let mut outcomes = vec![];
         for calls in [[16, 32], [64, 64]] {
@@ -338,9 +452,14 @@ impl Device for Spi {
         self.start_at(cx, at);
     }
     fn save(&self) -> Value {
-        json!({"base":self.base,"input":self.input.save(),"control":self.control,"enable":self.enable,
+        let mut state = json!({"base":self.base,"input":self.input.save(),"control":self.control,"enable":self.enable,
             "divider":self.divider,"causes":self.causes,"tx":self.tx,"rx":self.rx,"pending":self.pending,
-            "generation":self.generation})
+            "generation":self.generation});
+        // Absent when zero: checkpoints of polling-only runs stay byte-identical.
+        if self.request != 0 {
+            state["request"] = json!(self.request);
+        }
+        state
     }
     fn restore(&mut self, value: &Value) -> Result<(), String> {
         #[derive(serde::Deserialize)]
@@ -356,6 +475,8 @@ impl Device for Spi {
             rx: VecDeque<u16>,
             pending: Option<(u64, u64, u16, u32)>,
             generation: u64,
+            #[serde(default)]
+            request: u32,
         }
         let state: State = serde_json::from_value(value.clone()).map_err(|e| e.to_string())?;
         if state.base != self.base
@@ -364,6 +485,7 @@ impl Device for Spi {
             || state.tx.len() > 8
             || state.rx.len() > 8
             || state.causes & !1 != 0
+            || state.request & !3 != 0
             || state.pending.is_some_and(|(_, token, _, bits)| {
                 token != state.generation
                     || state.enable & 2 == 0
@@ -382,6 +504,7 @@ impl Device for Spi {
         self.rx = state.rx;
         self.pending = state.pending;
         self.generation = state.generation;
+        self.request = state.request;
         Ok(())
     }
 }

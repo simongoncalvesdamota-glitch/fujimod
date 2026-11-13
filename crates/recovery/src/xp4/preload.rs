@@ -72,6 +72,44 @@ pub struct Preload {
     pub exclusions: Vec<image::Bss>,
     pub defaults: BootDefaults,
     pub native_file: NativeFile,
+    /// RAM that stays free for the whole session on this body, when the common
+    /// SD-loader address is a live working area (X-T3 5.11: its kernel fills five
+    /// 128 KiB buffers over 0x124000..0x1c4014 after reset).
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub program_address: Option<usize>,
+}
+
+/// Literal-pool words of the compiled preloaded program that hold its own
+/// absolute addresses. Checked against the asset before any relocation.
+const PROGRAM_SELF_REFERENCES: [usize; 13] = [
+    0x44, 0x48, 0x74, 0x78, 0x3bc, 0x3c0, 0x3c4, 0x3c8, 0x3cc, 0x438, 0x43c, 0x45c, 0x4f0,
+];
+
+/// Moves the compiled program to `base`: every word before the configuration that
+/// points inside the program must be one of the known self-references.
+fn relocate_program(bytes: &[u8], from: usize, base: usize, config: usize) -> Result<Vec<u8>> {
+    let mut program = bytes.to_vec();
+    if base == from {
+        return Ok(program);
+    }
+    let mut found = Vec::new();
+    for offset in (0..config).step_by(4) {
+        let value = word(&program, offset)? as usize;
+        if (from..from + bytes.len()).contains(&value) {
+            found.push(offset);
+            put(
+                &mut program,
+                offset,
+                u32::try_from(value - from + base)
+                    .map_err(|_| image::Error::Invalid("Relocated program address overflows ARM32".into()))?,
+            )?;
+        }
+    }
+    require(
+        found == PROGRAM_SELF_REFERENCES,
+        "Preloaded program self-references differ from the checked asset",
+    )?;
+    Ok(program)
 }
 
 fn branch(at: usize, target: usize, link: bool) -> Result<u32> {
@@ -92,7 +130,7 @@ impl Preload {
         ram: &mut Vec<u8>,
     ) -> Result<Vec<u8>> {
         let layout = &sd_loader::LAYOUT.preloaded;
-        let program_base = layout.address;
+        let program_base = self.program_address.unwrap_or(layout.address);
         let program_bytes = extent(sd_loader::IMAGE, layout.offset, layout.size)?;
         require(
             self.ranges.len() <= 16
@@ -115,6 +153,14 @@ impl Preload {
                 "Startup working view exceeds declared RAM",
             )?;
         }
+        require(
+            program_base % 4 == 0
+                && program_base + layout.size <= self.address_limit
+                && !self.exclusions.iter().any(|view| {
+                    program_base < view.address + view.size && view.address < program_base + layout.size
+                }),
+            "Preloaded program overlaps an active working view",
+        )?;
         // Verify every original routine/table before applying any modifications.
         for proof in self
             .witnesses
@@ -236,8 +282,8 @@ impl Preload {
             }),
             "Preloaded program overlaps BSS",
         )?;
-        let mut program = program_bytes.to_vec();
         let config = layout.symbols["preloaded_config"];
+        let mut program = relocate_program(program_bytes, layout.address, program_base, config)?;
         for (index, value) in [
             self.enabled_byte,
             self.byte_limit,
@@ -447,8 +493,47 @@ mod tests {
                 wait_semaphore: proof(0x600),
                 signal_semaphore: proof(0x600),
             },
+            program_address: None,
         };
         (preload, input, plan, ram)
+    }
+
+    #[test]
+    fn a_body_program_address_moves_the_program_and_its_hooks() {
+        let (mut preload, input, plan, mut ram) = fixture();
+        preload.program_address = Some(0x1c0000);
+        preload.install(&input, &plan, 0, &mut ram).unwrap();
+        let layout = &sd_loader::LAYOUT.preloaded;
+        let config = 0x1c0000 + layout.symbols["preloaded_config"];
+        assert_eq!(word(&ram, config + 18 * 4).unwrap(), 0x1c0000);
+        for offset in PROGRAM_SELF_REFERENCES {
+            let value = word(&ram, 0x1c0000 + offset).unwrap() as usize;
+            assert!((0x1c0000..0x1c0000 + layout.size).contains(&value));
+        }
+        assert!(ram[layout.address..layout.address + layout.size].iter().all(|b| *b == 0));
+        // The discarded transfer at 0x100 now calls the moved program.
+        let call = word(&ram, 0x100).unwrap();
+        let offset = (((call & 0xffffff) << 8) as i32 >> 6) as i64;
+        assert_eq!(
+            (0x100 + 8 + offset) as usize,
+            0x1c0000 + layout.symbols["preloaded_discard"]
+        );
+    }
+
+    #[test]
+    fn a_program_inside_an_active_working_view_is_refused() {
+        let (mut preload, input, plan, mut ram) = fixture();
+        preload.exclusions.push(image::Bss {
+            name: "run-time kernel buffers".into(),
+            address: 0x190000,
+            size: 0x20000,
+        });
+        let original = ram.clone();
+        let error = preload.install(&input, &plan, 0, &mut ram).unwrap_err();
+        assert!(error.to_string().contains("Preloaded program overlaps"));
+        assert_eq!(ram, original);
+        preload.program_address = Some(0x1c0000);
+        preload.install(&input, &plan, 0, &mut ram).unwrap();
     }
 
     #[test]

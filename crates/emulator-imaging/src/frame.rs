@@ -10,16 +10,7 @@ pub fn paint(
     stride: u32,
     luma: u8,
 ) -> Result<(), String> {
-    if !(16..=235).contains(&luma)
-        || width == 0
-        || width & 1 != 0
-        || height == 0
-        || width > 4096
-        || height > 4096
-        || stride < width * 2
-        || stride & 3 != 0
-        || u64::from(stride) * u64::from(height) > 32 * 1024 * 1024
-    {
+    if !(16..=235).contains(&luma) || !geometry(width, height, stride) {
         return Err("fixed YUV source geometry/range exceeds modeled bounds".into());
     }
     address
@@ -28,6 +19,42 @@ pub fn paint(
     let row = [luma, luma, 128, 128].repeat(width as usize / 2);
     for y in 0..height {
         cx.ram_write(address + u64::from(y) * u64::from(stride), &row)?;
+    }
+    Ok(())
+}
+
+/// Output geometry both sources accept.
+fn geometry(width: u32, height: u32, stride: u32) -> bool {
+    width != 0
+        && width & 1 == 0
+        && height != 0
+        && width <= 4096
+        && height <= 4096
+        && stride >= width * 2
+        && stride & 3 == 0
+        && u64::from(stride) * u64::from(height) <= 32 * 1024 * 1024
+}
+
+/// Write a computed Y0,Y1,Cb,Cr picture (`width` * 2 bytes per row, rows
+/// packed) at a programmed DMA output, one row every `stride` bytes.
+pub fn copy(
+    cx: &mut Cx<'_>,
+    address: u64,
+    width: u32,
+    height: u32,
+    stride: u32,
+    picture: &[u8],
+) -> Result<(), String> {
+    if !geometry(width, height, stride)
+        || picture.len() as u64 != u64::from(width) * 2 * u64::from(height)
+    {
+        return Err("YUV picture geometry exceeds modeled bounds".into());
+    }
+    address
+        .checked_add(u64::from(stride) * u64::from(height))
+        .ok_or("YUV DMA address overflow")?;
+    for (y, row) in picture.chunks_exact(width as usize * 2).enumerate() {
+        cx.ram_write(address + y as u64 * u64::from(stride), row)?;
     }
     Ok(())
 }

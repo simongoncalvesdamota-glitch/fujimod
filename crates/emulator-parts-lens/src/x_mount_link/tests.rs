@@ -10,6 +10,8 @@ fn configuration() -> Configuration {
         focus_ring: 0xffff,
         detail_status: 0x14,
         read_catalogs: vec![],
+        family_replies: vec![],
+        focus_position: None,
     }
 }
 fn frame(byte: u8) -> Frame {
@@ -548,4 +550,177 @@ fn typed_checkpoint_restores_partial_headers_and_validates_pending_tokens() {
             .validate_checkpoint(&saved)
             .is_err()
     );
+}
+
+#[test]
+fn declared_family_replies_echo_or_answer_fixed_and_stay_off_by_default() {
+    // Off by default: the field is omitted and the family stays refused.
+    let plain = serde_json::to_value(configuration()).unwrap();
+    assert!(plain.get("family_replies").is_none());
+    let parsed: Configuration = serde_json::from_value(plain).unwrap();
+    assert!(parsed.family_replies.is_empty());
+    let mut link = Link::new(configuration()).unwrap();
+    let mut time = 0;
+    assert!(
+        transfer(&mut link, &Packet::encode(2, 0xa8, false).bytes(), &mut time)
+            .unwrap_err()
+            .contains("unmodeled")
+    );
+
+    let mut config = configuration();
+    config.family_replies = vec![
+        FamilyReply { family: 0xa8, payload: None },
+        FamilyReply { family: 0x21, payload: Some(0x1234) },
+    ];
+    let mut link = Link::new(config.clone()).unwrap();
+    let mut time = 0;
+    for (sequence, family, value, expected) in
+        [(0, 0xa8, 2, 2), (1, 0x21, 0, 0x1234), (2, 0xa8, 0x45, 0x45)]
+    {
+        assert_eq!(
+            word(&mut link, Packet::encode(value, family, false).0, &mut time),
+            0
+        );
+        assert_eq!(
+            word(
+                &mut link,
+                Packet::encode(0x0810 | sequence << 8, 0, true).0,
+                &mut time
+            ),
+            Packet::encode(0x0800, family, true).0
+        );
+        assert_eq!(
+            word(&mut link, 0, &mut time),
+            Packet::encode(expected, family, false).0
+        );
+        assert_eq!(
+            word(&mut link, Packet::encode(0x0800, family, true).0, &mut time),
+            Packet::encode(0x0800 | sequence << 8, 0, true).0
+        );
+        let saved = link.save();
+        let mut restored = Link::new(config.clone()).unwrap();
+        restored.restore(&saved).unwrap();
+        assert_eq!(restored.save(), saved);
+    }
+    assert!(
+        transfer(&mut link, &Packet::encode(0, 0x22, false).bytes(), &mut time)
+            .unwrap_err()
+            .contains("unmodeled")
+    );
+
+    // Modeled, out-of-range and duplicate families are rejected.
+    for family in [STATUS, CONTROL20, READ_CATALOG, 0x200] {
+        let mut bad = configuration();
+        bad.family_replies = vec![FamilyReply { family, payload: None }];
+        assert!(Link::new(bad).is_err());
+    }
+    let mut bad = configuration();
+    bad.family_replies = vec![
+        FamilyReply { family: 0xa8, payload: None },
+        FamilyReply { family: 0xa8, payload: Some(0) },
+    ];
+    assert!(Link::new(bad).is_err());
+}
+
+/// One normal request and its reply, with the acknowledgments of both ways.
+fn request(link: &mut Link, sequence: u16, family: u16, value: u16, time: &mut u64) -> u16 {
+    assert_eq!(word(link, Packet::encode(value, family, false).0, time), 0);
+    assert_eq!(
+        word(link, Packet::encode(0x0810 | sequence << 8, 0, true).0, time),
+        Packet::encode(0x0800, family, true).0
+    );
+    let reply = Packet(word(link, 0, time));
+    assert_eq!(reply.family(), family);
+    assert!(!reply.ack());
+    assert_eq!(
+        word(link, Packet::encode(0x0800, family, true).0, time),
+        Packet::encode(0x0800 | sequence << 8, 0, true).0
+    );
+    reply.payload()
+}
+fn focus_configuration(limits: [i16; 2]) -> Configuration {
+    let mut config = configuration();
+    config.family_replies = vec![
+        FamilyReply { family: 0x21, payload: None },
+        FamilyReply { family: 0x56, payload: None },
+    ];
+    config.focus_position = Some(FocusPosition {
+        read_family: 0x21,
+        read_payload: 1,
+        move_family: 0x56,
+        initial: 1,
+        limits,
+    });
+    config
+}
+
+#[test]
+fn focus_position_is_off_by_default_and_the_read_family_keeps_its_echo() {
+    let mut config = focus_configuration([-32767, 32767]);
+    config.focus_position = None;
+    let plain = serde_json::to_value(&config).unwrap();
+    assert!(plain.get("focus_position").is_none());
+    let mut link = Link::new(config).unwrap();
+    assert_eq!(link.focus_position(), None);
+    let mut time = 0;
+    // X-T3 5.11 run AFx: the read form is family 0x21, payload 1, echoed.
+    assert_eq!(request(&mut link, 0, 0x21, 1, &mut time), 1);
+    assert_eq!(request(&mut link, 1, 0x56, 0, &mut time), 0);
+    assert_eq!(request(&mut link, 2, 0x21, 1, &mut time), 1);
+    assert!(link.save()["state"].get("focus").is_none());
+}
+
+#[test]
+fn a_move_sets_the_signed_bounded_position_that_the_read_answers() {
+    let config = focus_configuration([-32767, 32767]);
+    let mut link = Link::new(config.clone()).unwrap();
+    let mut time = 0;
+    assert_eq!(request(&mut link, 0, 0x21, 1, &mut time), 1);
+    // X-T3 5.11 run AFy: the AF order of -1 sends family 0x56 with payload 0.
+    assert_eq!(request(&mut link, 1, 0x56, 0, &mut time), 0);
+    assert_eq!(link.focus_position(), Some(0));
+    assert_eq!(request(&mut link, 2, 0x21, 1, &mut time), 0);
+    // Signed payloads; other payloads of the read family keep their echo.
+    assert_eq!(request(&mut link, 3, 0x56, (-300i16) as u16, &mut time), (-300i16) as u16);
+    assert_eq!(request(&mut link, 4, 0x21, 1, &mut time), (-300i16) as u16);
+    assert_eq!(request(&mut link, 5, 0x21, 0x0110, &mut time), 0x0110);
+    let saved = link.save();
+    let mut restored = Link::new(config).unwrap();
+    restored.restore(&saved).unwrap();
+    assert_eq!(restored.focus_position(), Some(-300));
+    assert_eq!(restored.save(), saved);
+    // A checkpoint with a position does not restore into a link without one.
+    let mut plain = configuration();
+    plain.family_replies = focus_configuration([0, 0]).family_replies;
+    assert!(Link::new(plain).unwrap().restore(&saved).is_err());
+    // Reset returns to the declared initial value.
+    link.reset();
+    assert_eq!(link.focus_position(), Some(1));
+
+    let mut bounded = Link::new(focus_configuration([0, 100])).unwrap();
+    let mut time = 0;
+    request(&mut bounded, 0, 0x56, (-2i16) as u16, &mut time);
+    assert_eq!(request(&mut bounded, 1, 0x21, 1, &mut time), 0);
+    request(&mut bounded, 2, 0x56, 200, &mut time);
+    assert_eq!(request(&mut bounded, 3, 0x21, 1, &mut time), 100);
+}
+
+#[test]
+fn focus_position_configuration_rejects_reserved_equal_and_out_of_range_values() {
+    let good = focus_configuration([-32767, 32767]);
+    let parsed: Configuration =
+        serde_json::from_value(serde_json::to_value(&good).unwrap()).unwrap();
+    assert!(parsed == good);
+    for change in [
+        (|f: &mut FocusPosition| f.move_family = f.read_family) as fn(&mut FocusPosition),
+        |f| f.read_family = STATUS,
+        |f| f.move_family = SYNC,
+        |f| f.read_family = 0x200,
+        |f| f.initial = -32768,
+        |f| f.limits = [5, 4],
+    ] {
+        let mut bad = good.clone();
+        change(bad.focus_position.as_mut().unwrap());
+        assert!(Link::new(bad).is_err());
+    }
 }

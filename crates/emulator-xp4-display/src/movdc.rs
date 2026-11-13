@@ -13,6 +13,9 @@ struct State {
     pending: bool,
     frames: u64,
 }
+/// A computed processed-frame input: `(width, height)` -> packed Y0,Y1,Cb,Cr
+/// rows of `width` * 2 bytes. Construction input, not state.
+pub type Source = std::sync::Arc<dyn Fn(u32, u32) -> Vec<u8> + Send + Sync>;
 pub struct Movdc {
     base: u64,
     irq: u32,
@@ -22,6 +25,10 @@ pub struct Movdc {
     state: State,
     /// See [`Movdc::latch_configuration`]; construction input, not state.
     latch: bool,
+    /// See [`Movdc::with_source`]; construction input, not state.
+    source: Option<Source>,
+    /// See [`Movdc::accept_yuv420`]; construction input, not state.
+    yuv420: bool,
 }
 impl Movdc {
     pub fn new(
@@ -50,6 +57,8 @@ impl Movdc {
                 ..State::default()
             },
             latch: false,
+            source: None,
+            yuv420: false,
         })
     }
     fn r(&self, offset: usize) -> u32 {
@@ -80,13 +89,27 @@ impl Movdc {
         // by (8 << exponent) for this format. 01f31664/01f31aa8 select
         // +d8[17:16] with table 0140a944 = [3,3,3,2,1,0]. These are
         // horizontal transfer controls, not alternate pixel formats.
+        // +d8[1:0] is 2 in live view and 3 when X-T3 5.11 shows an enlarged
+        // crop (544x368 source window, rear dial at 1617M in run D1/T41).
+        // The source window stays unmodeled: mode 3 paints the same declared
+        // processed frame at the programmed output size as mode 2.
+        // +08[1:0] is the output format written by 01055d74 (0x100 | format).
+        // 011117ac's divisor base is 01111770's per-format factor
+        // [8, 6, 16, 4] beside 01111818's row units [0x100, 0xc0, 0x200,
+        // 0x80]: 2, 1.5, 4 and 1 bytes per pixel. Format 1 (X-T3 5.11 FHD
+        // movie recording, 1920x1080) is read as 4:2:0 at 1.5 bytes per
+        // pixel; it is accepted only with `accept_yuv420`.
         let exponent = (self.r(0xd4) >> 16) & 7;
         let selector = [3, 3, 3, 2, 1, 0].get(exponent as usize);
         let width = (self.r(0x18) & 0x7ff) + 1;
-        if self.r(8) != 0x100
-            || selector.is_none_or(|selector| self.r(0xd8) != 0x10000002 | selector << 16)
+        let yuv420 = self.yuv420 && self.r(8) == 0x101;
+        let factor = if yuv420 { 6 } else { 8 };
+        if !(self.r(8) == 0x100 || yuv420)
+            || selector.is_none_or(|selector| {
+                !matches!(self.r(0xd8) ^ (0x10000000 | selector << 16), 2 | 3)
+            })
             || self.r(0xd4) & !0x10070000 != 0
-            || width % (8 << exponent) != 0
+            || width % (factor << exponent) != 0
             || self.r(0x18) & !0x07ff07ff != 0
             || self.r(0xc0) > 3
             || self.r(0xc8) != 0
@@ -99,14 +122,60 @@ impl Movdc {
         if address == 0 || address & 7 != 0 {
             return Err("XP4 MOVDC needs a nonzero aligned DMA destination".into());
         }
-        frame::paint(
-            cx,
-            address,
-            width,
-            (size >> 16) + 1,
-            self.r(0xd0),
-            self.luma,
-        )?;
+        if yuv420 {
+            return self.luma_plane(cx, address, width, (size >> 16) + 1);
+        }
+        match &self.source {
+            Some(source) => {
+                let height = (size >> 16) + 1;
+                frame::copy(cx, address, width, height, self.r(0xd0), &source(width, height))?;
+            }
+            None => frame::paint(
+                cx,
+                address,
+                width,
+                (size >> 16) + 1,
+                self.r(0xd0),
+                self.luma,
+            )?,
+        }
+        self.state.frames += 1;
+        self.state.pending = true;
+        self.irq(cx);
+        Ok(())
+    }
+    /// Format 1: only the luma plane, `width` bytes per row every +d0 bytes,
+    /// from the source's Y0,Y1 samples or the declared fixed luma. Where the
+    /// chroma plane goes (no second address among the modeled words) is not
+    /// known, so chroma is not written. Completion, interrupt and timing are
+    /// those of the packed output.
+    fn luma_plane(&mut self, cx: &mut Cx<'_>, address: u64, width: u32, height: u32) -> Result<(), String> {
+        let stride = self.r(0xd0);
+        if width & 1 != 0
+            || width > 4096
+            || height > 4096
+            || stride < width
+            || stride & 3 != 0
+            || u64::from(stride) * u64::from(height) > 32 * 1024 * 1024
+        {
+            return Err("YUV picture geometry exceeds modeled bounds".into());
+        }
+        address
+            .checked_add(u64::from(stride) * u64::from(height))
+            .ok_or("YUV DMA address overflow")?;
+        let plane: Vec<u8> = match &self.source {
+            Some(source) => {
+                let packed = source(width, height);
+                if packed.len() as u64 != u64::from(width) * 2 * u64::from(height) {
+                    return Err("YUV picture geometry exceeds modeled bounds".into());
+                }
+                packed.chunks_exact(4).flat_map(|p| [p[0], p[1]]).collect()
+            }
+            None => vec![self.luma; width as usize * height as usize],
+        };
+        for (y, row) in plane.chunks_exact(width as usize).enumerate() {
+            cx.ram_write(address + y as u64 * u64::from(stride), row)?;
+        }
         self.state.frames += 1;
         self.state.pending = true;
         self.irq(cx);
@@ -133,6 +202,21 @@ impl Movdc {
     /// emulated: frames keep the declared processed-frame input.
     pub fn latch_configuration(mut self) -> Self {
         self.latch = true;
+        self
+    }
+    /// Produce each frame from `source` at the programmed output size instead
+    /// of the declared fixed luma (opt-in). Same registers, interrupt and
+    /// timing; only the bytes written change.
+    pub fn with_source(mut self, source: Source) -> Self {
+        self.source = Some(source);
+        self
+    }
+    /// Accept output format 1 (+08 = 0x101, X-T3 5.11 FHD movie recording)
+    /// as 4:2:0 luma only (opt-in; default: refused like formats 2 and 3).
+    /// Widths then divide by 6 << exponent, as the firmware chooses them;
+    /// format 0 is unchanged. See [`Movdc::luma_plane`].
+    pub fn accept_yuv420(mut self) -> Self {
+        self.yuv420 = true;
         self
     }
 }
@@ -360,6 +444,32 @@ mod tests {
         assert_eq!(experiment(0x1000, false), experiment(0x987654, true));
     }
     #[test]
+    fn a_source_replaces_the_fixed_luma_and_keeps_timing_and_state() {
+        let fixed = experiment(0x1000, false);
+        let (mut d, mut h) = setup(0x1000, 0x10030002);
+        let asked = std::sync::Arc::new(std::sync::Mutex::new(Vec::new()));
+        let seen = asked.clone();
+        d = d.with_source(std::sync::Arc::new(move |width, height| {
+            seen.lock().unwrap().push((width, height));
+            (0..width * 2 * height).map(|i| i as u8).collect()
+        }));
+        h.now = 33;
+        d.advance(&mut Cx::new(&mut h, 0, 0x1000, 0));
+        assert_eq!(*asked.lock().unwrap(), [(32, 2)]);
+        let picture: Vec<u8> = (0..128u32).map(|i| i as u8).collect();
+        assert_eq!(&h.ram[64..128], &picture[..64]);
+        assert_eq!(&h.ram[144..208], &picture[64..]);
+        assert_eq!(&h.ram[128..144], &[0xaa; 16]);
+        assert!(h.irqs.contains(&(33, 108, true)));
+        assert_eq!(d.state.frames, 1);
+        // Same checkpoint as the fixed source at the same point.
+        let (mut f, mut g) = setup(0x1000, 0x10030002);
+        g.now = 33;
+        f.advance(&mut Cx::new(&mut g, 0, 0x1000, 0));
+        assert_eq!(d.save(), f.save());
+        assert_eq!(fixed, experiment(0x1000, false));
+    }
+    #[test]
     fn horizontal_transfer_exponent_and_selector_preserve_packed_rows() {
         for exponent in 0..6 {
             let (mut d, mut h) = setup(0, 0x10030002);
@@ -403,6 +513,30 @@ mod tests {
         }
     }
     #[test]
+    fn cropped_mode_three_paints_like_live_view_mode_two() {
+        let run = |mode| {
+            let (mut d, mut h) = setup(0, mode);
+            h.now = 33;
+            let mut cx = Cx::new(&mut h, 0, 0, 0);
+            d.advance(&mut cx);
+            assert_eq!(cx.refusal(), None);
+            assert_eq!(d.state.frames, 1);
+            assert!(d.state.pending);
+            d.state.regs[0xd8 / 4] = 0;
+            (d.save(), h.ram, h.irqs)
+        };
+        assert_eq!(run(0x10030003), run(0x10030002));
+        // Other +d8 bits stay refused, as do modes 0 and 1.
+        for mode in [0x10030000, 0x10030001, 0x10030007, 0x10020003, 0x30030003] {
+            let (mut d, mut h) = setup(0, mode);
+            h.now = 33;
+            let mut cx = Cx::new(&mut h, 0, 0, 0);
+            d.advance(&mut cx);
+            assert!(cx.refusal().unwrap().contains("output mode"));
+            assert_eq!(d.state.frames, 0);
+        }
+    }
+    #[test]
     fn unselected_modes_refuse_before_dma_or_completion() {
         let (mut d, mut h) = setup(0, 0x10030001);
         for offset in [0x20, 0x40, 0xe0, 0xe4, 0x100] {
@@ -419,5 +553,107 @@ mod tests {
         assert_eq!(d.state.frames, 0);
         assert!(!d.state.pending);
         assert!(h.ram.iter().all(|v| *v == 0xaa));
+    }
+
+    /// Format 1 setup: +08 = 0x101, `width` x 2 rows, exponent `exponent`.
+    fn yuv420(d: Movdc, width: u32, exponent: u32, stride: u32) -> (Movdc, Clock) {
+        output(d, 0x101, width, exponent, stride)
+    }
+    fn output(d: Movdc, format: u64, width: u32, exponent: u32, stride: u32) -> (Movdc, Clock) {
+        let mut d = d;
+        let mut h = Clock {
+            now: 10,
+            ram: vec![0xaa; 64 + stride as usize * 2 + 64],
+            irqs: vec![],
+        };
+        put(&mut d, &mut h, 0, 0, 0);
+        h.now = 13;
+        d.advance(&mut Cx::new(&mut h, 1, 0, 0));
+        for (offset, value) in [
+            (8, format),
+            (0x18, 0x10000 | u64::from(width - 1)),
+            (0xc4, 64),
+            (0xd0, u64::from(stride)),
+            (0xd8, 0x10000002 | [3, 3, 3, 2, 1, 0][exponent as usize] << 16),
+            (0xd4, 0x10000000 | u64::from(exponent) << 16),
+            (4, 1),
+        ] {
+            put(&mut d, &mut h, 0, offset, value);
+        }
+        h.now = 33;
+        (d, h)
+    }
+    #[test]
+    fn format_one_stays_refused_without_the_option() {
+        let (mut d, mut h) = yuv420(Movdc::new(0xfff73000, 108, 3, 20, 81).unwrap(), 192, 5, 200);
+        let mut cx = Cx::new(&mut h, 0, 0, 0);
+        d.advance(&mut cx);
+        assert!(cx.refusal().unwrap().contains("output mode"));
+        assert_eq!(d.state.frames, 0);
+        assert!(h.ram.iter().all(|v| *v == 0xaa));
+    }
+    #[test]
+    fn format_one_writes_the_luma_plane_only_with_the_firmware_divisor() {
+        let new = || Movdc::new(0xfff73000, 108, 3, 20, 81).unwrap().accept_yuv420();
+        // 1920 = 10 x (6 << 5): the X-T3 5.11 FHD recording output.
+        for (width, exponent) in [(192, 5), (1920, 5), (96, 4), (12, 1)] {
+            let stride = (width + 63) & !63;
+            let (mut d, mut h) = yuv420(new(), width, exponent, stride);
+            let mut cx = Cx::new(&mut h, 0, 0, 0);
+            d.advance(&mut cx);
+            assert_eq!(cx.refusal(), None, "{width}");
+            let w = width as usize;
+            let s = stride as usize;
+            assert!(h.ram[64..64 + w].iter().all(|v| *v == 81));
+            assert!(h.ram[64 + s..64 + s + w].iter().all(|v| *v == 81));
+            assert!(h.ram[64 + w..64 + s].iter().all(|v| *v == 0xaa));
+            assert!(h.ram[..64].iter().chain(&h.ram[64 + 2 * s..]).all(|v| *v == 0xaa));
+            assert!(h.irqs.contains(&(33, 108, true)));
+            assert_eq!(d.state.frames, 1);
+            assert!(d.state.pending);
+        }
+        // A width the factor 6 does not divide stays refused, as do formats 2 and 3.
+        let (mut d, mut h) = yuv420(new(), 1920 - 64, 5, 1920);
+        let mut cx = Cx::new(&mut h, 0, 0, 0);
+        d.advance(&mut cx);
+        assert!(cx.refusal().is_some());
+        for format in [0x102, 0x103, 0x1] {
+            let (mut d, mut h) = output(new(), format, 192, 5, 200);
+            let mut cx = Cx::new(&mut h, 0, 0, 0);
+            d.advance(&mut cx);
+            assert!(cx.refusal().is_some(), "{format:#x}");
+            assert_eq!(d.state.frames, 0);
+        }
+    }
+    #[test]
+    fn format_one_takes_the_luma_of_the_source() {
+        let d = Movdc::new(0xfff73000, 108, 3, 20, 81)
+            .unwrap()
+            .with_source(std::sync::Arc::new(|width, height| {
+                (0..width * 2 * height).map(|i| i as u8).collect()
+            }))
+            .accept_yuv420();
+        let (mut d, mut h) = yuv420(d, 12, 1, 16);
+        let mut cx = Cx::new(&mut h, 0, 0, 0);
+        d.advance(&mut cx);
+        assert_eq!(cx.refusal(), None);
+        // Packed Y0,Y1,Cb,Cr: bytes 0,1,4,5,... of each 24-byte row.
+        let y: Vec<u8> = (0..48u8).filter(|i| i % 4 < 2).collect();
+        assert_eq!(&h.ram[64..76], &y[..12]);
+        assert_eq!(&h.ram[80..92], &y[12..]);
+        assert_eq!(&h.ram[76..80], &[0xaa; 4]);
+    }
+    #[test]
+    fn the_option_leaves_format_zero_unchanged() {
+        let plain = experiment(0x1000, false);
+        let (mut d, mut h) = setup(0x1000, 0x10030002);
+        d.yuv420 = true;
+        h.now = 33;
+        d.advance(&mut Cx::new(&mut h, 0, 0x1000, 0));
+        let (mut f, mut g) = setup(0x1000, 0x10030002);
+        g.now = 33;
+        f.advance(&mut Cx::new(&mut g, 0, 0x1000, 0));
+        assert_eq!((d.save(), &h.ram, &h.irqs), (f.save(), &g.ram, &g.irqs));
+        assert_eq!(plain, experiment(0x1000, false));
     }
 }

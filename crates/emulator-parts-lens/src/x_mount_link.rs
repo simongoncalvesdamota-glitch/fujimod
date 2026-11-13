@@ -2,6 +2,7 @@
 //!
 //! Supported exchanges are sync, link parameters, identification, status,
 //! ring reads, and declared read-only catalogs. Bounded command20 writes latch on sync.
+//! Further families answer only when declared in `family_replies`.
 //! Unknown commands refuse. GPIO/power behavior, optical stabilization and
 //! boot qualification are outside this part.
 use fujimod_emulator_parts_io::serial::{Frame, Wire};
@@ -80,6 +81,14 @@ impl ReadCatalog {
         ((self.attributes as u16) << 11) | (self.data.len() / CATALOG_BLOCK_BYTES) as u16
     }
 }
+/// Declared reply for one otherwise unmodeled request family.
+#[derive(Clone, Copy, Serialize, Deserialize, PartialEq, Eq)]
+#[serde(deny_unknown_fields)]
+pub struct FamilyReply {
+    pub family: u16,
+    /// Fixed reply payload; `None` echoes the request payload.
+    pub payload: Option<u16>,
+}
 #[derive(Clone, Copy, Serialize, Deserialize)]
 #[serde(tag = "kind", rename_all = "kebab-case", deny_unknown_fields)]
 enum BulkSource {
@@ -102,6 +111,28 @@ pub struct Configuration {
     pub focus_ring: u16,
     pub detail_status: u16,
     pub read_catalogs: Vec<ReadCatalog>,
+    /// Optional replies for further families. Empty (the default) keeps
+    /// every other family refused.
+    #[serde(default, skip_serializing_if = "Vec::is_empty")]
+    pub family_replies: Vec<FamilyReply>,
+    /// Optional stateful focus position. Absent (the default) keeps the
+    /// declared family replies unchanged.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub focus_position: Option<FocusPosition>,
+}
+/// A focus position the lens keeps: `move_family` sets it to its signed
+/// payload (bounded by `limits`); `read_family` with `read_payload` answers it.
+/// X-T3 5.11 runs AFx/AFy: read = family 0x21 payload 1, move = family 0x56.
+/// The initial value and limits are declared inputs, not a lens calibration:
+/// a mid-travel start (for example 512) is an assumption; 0 would be an end stop.
+#[derive(Clone, Copy, Serialize, Deserialize, PartialEq, Eq)]
+#[serde(deny_unknown_fields)]
+pub struct FocusPosition {
+    pub read_family: u16,
+    pub read_payload: u16,
+    pub move_family: u16,
+    pub initial: i16,
+    pub limits: [i16; 2],
 }
 #[derive(Clone, Copy, Serialize, Deserialize)]
 #[serde(deny_unknown_fields)]
@@ -137,6 +168,16 @@ struct State {
     last_tick: Option<u64>,
     control20: Option<u16>,
     staged_control20: Option<u16>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    focus: Option<i16>,
+}
+impl State {
+    fn initial(configuration: &Configuration) -> Self {
+        Self {
+            focus: configuration.focus_position.map(|f| f.initial),
+            ..Self::default()
+        }
+    }
 }
 
 pub struct Link {
@@ -161,14 +202,64 @@ impl Link {
                 return Err("invalid X-mount read catalog geometry/selector/metadata".into());
             }
         }
+        for (index, reply) in configuration.family_replies.iter().enumerate() {
+            if reply.family > 0x1ff
+                || [
+                    0,
+                    SYNC,
+                    PARAMETERS,
+                    IDENTIFICATION,
+                    STATUS,
+                    APERTURE_RING,
+                    FOCUS_RING,
+                    DETAIL_STATUS,
+                    READ_CATALOG,
+                    CONTROL20,
+                ]
+                .contains(&reply.family)
+                || configuration.family_replies[..index]
+                    .iter()
+                    .any(|r| r.family == reply.family)
+            {
+                return Err("invalid X-mount family reply".into());
+            }
+        }
+        if let Some(focus) = configuration.focus_position {
+            let reserved = [
+                0,
+                SYNC,
+                PARAMETERS,
+                IDENTIFICATION,
+                STATUS,
+                APERTURE_RING,
+                FOCUS_RING,
+                DETAIL_STATUS,
+                READ_CATALOG,
+                CONTROL20,
+            ];
+            if focus.read_family > 0x1ff
+                || focus.move_family > 0x1ff
+                || focus.read_family == focus.move_family
+                || reserved.contains(&focus.read_family)
+                || reserved.contains(&focus.move_family)
+                || !(focus.limits[0]..=focus.limits[1]).contains(&focus.initial)
+            {
+                return Err("invalid X-mount focus position".into());
+            }
+        }
+        let state = State::initial(&configuration);
         Ok(Self {
             configuration,
-            state: State::default(),
+            state,
         })
     }
     /// Explicit external reset; serial-controller FIFO reset is a separate wire.
     pub fn reset(&mut self) {
-        self.state = State::default();
+        self.state = State::initial(&self.configuration);
+    }
+    /// The kept focus position, when `focus_position` is declared.
+    pub fn focus_position(&self) -> Option<i16> {
+        self.state.focus
     }
     pub fn frame_count(&self) -> u64 {
         self.state.frames
@@ -178,6 +269,13 @@ impl Link {
             return Err("X-mount link requires byte-wide SPI mode 3".into());
         }
         Ok(())
+    }
+    fn family_reply(&self, family: u16) -> Option<FamilyReply> {
+        self.configuration
+            .family_replies
+            .iter()
+            .find(|r| r.family == family)
+            .copied()
     }
     fn response(&self, packet: Packet) -> Result<Option<u16>, String> {
         if packet.ack() {
@@ -201,7 +299,17 @@ impl Link {
             (PARAMETERS, value) if value == self.configuration.peer_parameters => {
                 Ok(Some(self.configuration.parameters))
             }
-            _ => Err(format!("X-mount request is unmodeled: {:08x}", packet.0)),
+            (family, value)
+                if self.configuration.focus_position.is_some_and(|f| {
+                    f.read_family == family && f.read_payload == value
+                }) =>
+            {
+                Ok(Some(self.state.focus.unwrap_or_default() as u16))
+            }
+            (family, value) => match self.family_reply(family) {
+                Some(reply) => Ok(Some(reply.payload.unwrap_or(value))),
+                None => Err(format!("X-mount request is unmodeled: {:08x}", packet.0)),
+            },
         }
     }
     fn valid_message(&self, message: Message) -> bool {
@@ -227,7 +335,17 @@ impl Link {
             (FOCUS_RING, payload) => payload == self.configuration.focus_ring,
             (DETAIL_STATUS, payload) => payload == self.configuration.detail_status,
             (CONTROL20, 0..=1) => true,
-            _ => false,
+            (family, _)
+                if self
+                    .configuration
+                    .focus_position
+                    .is_some_and(|f| f.read_family == family) =>
+            {
+                true
+            }
+            (family, payload) => self
+                .family_reply(family)
+                .is_some_and(|r| r.payload.is_none_or(|p| p == payload)),
         }
     }
     fn deliver(&mut self, packet: Packet, ack: Packet) -> Result<(), String> {
@@ -246,6 +364,12 @@ impl Link {
                 catalog: (packet.family() == READ_CATALOG).then_some(packet.payload() as u8),
             });
             self.state.transmit_counter = (self.state.transmit_counter + 1) & 7;
+        }
+        if let Some(focus) = self.configuration.focus_position
+            && packet.family() == focus.move_family
+        {
+            let target = packet.payload() as i16;
+            self.state.focus = Some(target.clamp(focus.limits[0], focus.limits[1]));
         }
         match packet.family() {
             CONTROL20 => self.state.staged_control20 = Some(packet.payload()),
@@ -404,6 +528,11 @@ impl Link {
             || candidate.staged_control20.is_some_and(|v| v > 1)
             || candidate.last_tick.is_some() != (candidate.frames != 0)
             || candidate.replies.len() > 4
+            || match (self.configuration.focus_position, candidate.focus) {
+                (None, None) => false,
+                (Some(f), Some(v)) => !(f.limits[0]..=f.limits[1]).contains(&v),
+                _ => true,
+            }
             || candidate
                 .replies
                 .iter()
